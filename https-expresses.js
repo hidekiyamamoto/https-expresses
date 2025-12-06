@@ -12,12 +12,15 @@ const { X509Certificate } = require('crypto');
 const DEFAULT_CONFIG = {
   serversPattern: '.*\\.hts.js$',
   staticPattern: '.*\\.hts.txt$',
+  staticDirs: [],
   manualModules: [],
   certRoot: '/etc/letsencrypt/live',
   httpsPort: 443,
 };
 
 let SERVERS_PATTERN = new RegExp(DEFAULT_CONFIG.serversPattern);
+let STATIC_PATTERN = new RegExp(DEFAULT_CONFIG.staticPattern);
+let STATIC_DIRS = [...DEFAULT_CONFIG.staticDirs];
 let MANUAL_SERVER_MODULES = [...DEFAULT_CONFIG.manualModules];
 let CERT_ROOT = DEFAULT_CONFIG.certRoot;
 let HTTPS_PORT = DEFAULT_CONFIG.httpsPort; // Number(process.env.HTTPS_PORT || 443);
@@ -91,9 +94,78 @@ const express = loadExternalModule('express');
 const serveStatic = loadExternalModule('serve-static');
 const compression = loadExternalModule('compression');
 
+function buildTemplateContent() {
+  return `'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const express = require('express');
+const compression = require('compression');
+
+// Domains this service will answer for. Update these to your real hostnames.
+const DOMAINS = ['example.com', 'www.example.com'];
+
+// Optional metadata shown in https-expresses summaries.
+const MODULE_META = {
+  description: 'Starter Express app for https-expresses.',
+};
+
+module.exports = {
+  domains: DOMAINS,
+  meta: MODULE_META,
+  async init() {
+    const app = express();
+
+    // Core middleware
+    app.use(compression());
+    app.use(express.json({ limit: '5mb' }));
+    app.use(express.urlencoded({ extended: false }));
+
+    // Health endpoint
+    app.get('/healthz', (req, res) => {
+      res.json({ status: 'ok', service: 'template.hts.js', at: new Date().toISOString() });
+    });
+
+    // Static files (optional)
+    const publicDir = path.join(__dirname, 'www-public');
+    if (fs.existsSync(publicDir) && fs.statSync(publicDir).isDirectory()) {
+      app.use(express.static(publicDir));
+      console.log('[TEMPLATE] Serving static files from', publicDir);
+    }
+
+    // Simple home
+    app.get('/', (req, res) => {
+      res.send('Hello from template.hts.js');
+    });
+
+    return {
+      app,
+      domains: DOMAINS,
+      meta: MODULE_META,
+    };
+  },
+};
+`;
+}
+
+function writeTemplateFile(destination) {
+  const targetPath = path.isAbsolute(destination)
+    ? destination
+    : path.join(process.cwd(), destination);
+  const content = buildTemplateContent();
+  try {
+    fs.writeFileSync(targetPath, content, 'utf8');
+    console.log(`Template written to ${targetPath}`);
+  } catch (error) {
+    console.error(`Failed to write template to ${targetPath}: ${error.message}`);
+    throw error;
+  }
+}
+
 function parseCliArgs(argv = process.argv.slice(2)) {
   const options = {};
   const manualModules = [];
+  const staticDirs = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -119,6 +191,24 @@ function parseCliArgs(argv = process.argv.slice(2)) {
         options.serversPattern = argv[i + 1];
         i += 1;
         break;
+      case '--static-pattern':
+        options.staticPattern = argv[i + 1];
+        i += 1;
+        break;
+      case '--static-dir':
+        staticDirs.push(argv[i + 1]);
+        i += 1;
+        break;
+      case '--write-template': {
+        const nextVal = argv[i + 1];
+        if (nextVal && !nextVal.startsWith('-')) {
+          options.writeTemplate = nextVal;
+          i += 1;
+        } else {
+          options.writeTemplate = 'template.hts.js';
+        }
+        break;
+      }
       default:
         // ignore unknown flags for now
         break;
@@ -128,12 +218,34 @@ function parseCliArgs(argv = process.argv.slice(2)) {
   if (manualModules.length) {
     options.manualModules = manualModules.filter(Boolean);
   }
+  if (staticDirs.length) {
+    options.staticDirs = staticDirs.filter(Boolean);
+  }
   return options;
 }
 
 function applyConfiguration(overrides = {}) {
   if (overrides.serversPattern) {
     SERVERS_PATTERN = new RegExp(overrides.serversPattern);
+  }
+
+  if (overrides.staticPattern) {
+    STATIC_PATTERN = new RegExp(overrides.staticPattern);
+  }
+
+  if (Array.isArray(overrides.staticDirs)) {
+    const combinedDirs = [...DEFAULT_CONFIG.staticDirs, ...overrides.staticDirs].filter(Boolean);
+    const seenDirs = new Set();
+    STATIC_DIRS = combinedDirs
+      .map((dir) => (path.isAbsolute(dir) ? dir : path.join(__dirname, dir)))
+      .map((dir) => path.normalize(dir))
+      .filter((dir) => {
+        if (seenDirs.has(dir)) {
+          return false;
+        }
+        seenDirs.add(dir);
+        return true;
+      });
   }
 
   if (Array.isArray(overrides.manualModules)) {
@@ -169,10 +281,14 @@ Options:
   --https-port <port>       HTTPS port to listen on (default: ${DEFAULT_CONFIG.httpsPort})
   --cert-root <path>        Directory containing certificate folders (default: ${DEFAULT_CONFIG.certRoot})
   --pattern <regex>         Regex for auto-loading server modules (default: ${DEFAULT_CONFIG.serversPattern})
+  --static-pattern <regex>  Regex for auto-loading static definitions (default: ${DEFAULT_CONFIG.staticPattern})
+  --static-dir <path>       Extra directory to scan for static definitions; repeatable (default: ${DEFAULT_CONFIG.staticDirs.join(', ') || 'none'})
   --manual-module <path>    Extra module path(s) to load; repeatable (default: ${DEFAULT_CONFIG.manualModules.join(', ')})
+  --write-template [path]   Write a starter template file (default path: template.hts.js) and exit
 
 What it does:
   - Discovers Express apps from files matching the pattern and manual module list.
+  - Discovers static site definitions from files matching --static-pattern.
   - Auto-loads certificates from --cert-root and configures SNI.
   - Routes HTTPS traffic by Host header to the matching Express app.
 
@@ -190,6 +306,51 @@ function discoverServerModules() {
   return directoryEntries
     .filter((entry) => entry.isFile() && SERVERS_PATTERN.test(entry.name))
     .map((entry) => entry.name);
+}
+
+function discoverStaticFiles() {
+  const matches = new Set();
+  const skipDirs = new Set(['node_modules', '.git', '.hg', '.svn']);
+
+  const roots = STATIC_DIRS.length ? STATIC_DIRS : ['/'];
+
+  roots.forEach((root) => {
+    const rootPath = path.normalize(root);
+    if (!fs.existsSync(rootPath) || !fs.statSync(rootPath).isDirectory()) {
+      console.warn(`Static dir ${rootPath} does not exist or is not a directory; skipping.`);
+      return;
+    }
+
+    const stack = [rootPath];
+    while (stack.length) {
+      const current = stack.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(current, { withFileTypes: true });
+      } catch (error) {
+        console.warn(`Could not read directory ${current}: ${error.message}`);
+        continue;
+      }
+
+      entries.forEach((entry) => {
+        const fullPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          if (!skipDirs.has(entry.name)) {
+            stack.push(fullPath);
+          }
+          return;
+        }
+        if (entry.isFile() && STATIC_PATTERN.test(entry.name)) {
+          matches.add(path.normalize(fullPath));
+        }
+      });
+    }
+  });
+
+  return Array.from(matches).map((absolutePath) => ({
+    absolutePath,
+    displayName: path.basename(absolutePath),
+  }));
 }
 
 async function loadServerDescriptor(modulePath) {
@@ -263,6 +424,115 @@ async function loadServerDescriptor(modulePath) {
   return { app, domains, meta };
 }
 
+function parseStaticDomains(filePath, filename) {
+  const sanitizeDomain = (value) => {
+    let domain = value.trim();
+    domain = domain.replace(/^https?:\/\//i, '');
+    domain = domain.replace(/\/+$/, '');
+    return domain;
+  };
+
+  try {
+    const contents = fs.readFileSync(filePath, 'utf8');
+    const rawLines = contents.split(/\r?\n/);
+
+    const domains = [];
+    const rewrittenLines = [];
+    let changed = false;
+
+    rawLines.forEach((line) => {
+      const trimmed = line.trim();
+      if (trimmed !== line) {
+        changed = true;
+      }
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) {
+        rewrittenLines.push(line);
+        return;
+      }
+
+      const sanitized = sanitizeDomain(trimmed);
+      if (sanitized !== trimmed) {
+        changed = true;
+      }
+
+      rewrittenLines.push(sanitized);
+
+      if (sanitized) {
+        domains.push(sanitized);
+      }
+    });
+
+    const updatedContent = rewrittenLines.join('\n');
+
+    if (changed && updatedContent !== contents) {
+      try {
+        fs.writeFileSync(filePath, updatedContent, 'utf8');
+        console.log(`Normalized static definition ${filename}`);
+      } catch (writeError) {
+        console.warn(
+          `Could not rewrite static definition ${filename} without protocol prefixes: ${writeError.message}`
+        );
+      }
+    }
+
+    if (domains.length) {
+      return domains;
+    }
+  } catch (error) {
+    console.warn(`Could not read static definition ${filename}: ${error.message}`);
+  }
+
+  // Fallback: infer from filename by stripping known extensions
+  const base = filename.replace(/\.hts\.txt$/i, '').replace(/\.txt$/i, '');
+  return base ? [base] : [];
+}
+
+function loadStaticDescriptors() {
+  const discovered = discoverStaticFiles();
+
+  return discovered.map(({ absolutePath, displayName }) => {
+    const domains = parseStaticDomains(absolutePath, displayName);
+    return {
+      type: 'static',
+      filename: displayName,
+      absolutePath,
+      domains,
+    };
+  });
+}
+
+function createStaticApp(rootDir) {
+  if (!fs.existsSync(rootDir) || !fs.statSync(rootDir).isDirectory()) {
+    throw new Error(`Static root ${rootDir} does not exist or is not a directory`);
+  }
+  const app = express();
+  app.use(compression());
+  app.use(
+    serveStatic(rootDir, {
+      fallthrough: true,
+      extensions: ['html', 'htm'],
+    })
+  );
+  app.use((req, res) => {
+    res.status(404).send('Not found');
+  });
+  return app;
+}
+
+function createStaticAppDescriptors(staticDescriptors) {
+  const results = [];
+  staticDescriptors.forEach(({ filename, absolutePath, domains }) => {
+    const rootDir = path.dirname(absolutePath);
+    try {
+      const app = createStaticApp(rootDir);
+      results.push({ filename, domains, app });
+    } catch (error) {
+      console.warn(`Skipping static ${filename}: ${error.message}`);
+    }
+  });
+  return results;
+}
+
 async function loadServersFromDisk() {
   const discovered = discoverServerModules().map((filename) => ({
     absolutePath: path.join(__dirname, filename),
@@ -290,7 +560,8 @@ async function loadServersFromDisk() {
   });
 
   if (!moduleSpecs.length) {
-    throw new Error('No server modules matching hts.js were found in this directory.');
+    console.error('No server modules matching hts.js were found in this directory.');
+    //throw new Error('No server modules matching hts.js were found in this directory.');
   }
 
   const serverDescriptors = [];
@@ -382,7 +653,7 @@ function hasCertificateForDomain(domain, certEntries) {
   return certEntries.some(({ domains }) => domains.some((pattern) => domainMatchesPattern(domain, pattern)));
 }
 
-function writeConfigFile(serverDescriptors, certEntries) {
+function writeConfigFile(serverDescriptors, staticDescriptors, certEntries) {
   const configPath = path.join(__dirname, 'https-expresses.cfg');
   const lines = [];
 
@@ -398,14 +669,43 @@ function writeConfigFile(serverDescriptors, certEntries) {
     lines.push('');
   });
 
+  staticDescriptors.forEach(({ filename, absolutePath, domains }) => {
+    lines.push(filename);
+    lines.push('  type: static');
+    lines.push(`  dir: ${path.dirname(absolutePath || path.join(__dirname, filename))}`);
+    lines.push('  domains:');
+    if (!domains.length) {
+      lines.push('    - (none) (cert: n/a)');
+    } else {
+      domains.forEach((domain) => {
+        const certStatus = hasCertificateForDomain(domain, certEntries) ? 'present' : 'missing';
+        lines.push(`    - ${domain} (cert: ${certStatus})`);
+      });
+    }
+    lines.push('');
+  });
+
   fs.writeFileSync(configPath, lines.join('\n'));
   console.log(`Wrote config summary to ${configPath}`);
 }
 
-function buildDomainAppMap(serverDescriptors) {
+function buildDomainAppMap(serverDescriptors, staticAppDescriptors = []) {
   const domainToApp = new Map();
 
   serverDescriptors.forEach(({ domains, app, filename }) => {
+    domains.forEach((domain) => {
+      const normalized = String(domain).trim().toLowerCase();
+      if (!normalized) {
+        return;
+      }
+      if (domainToApp.has(normalized)) {
+        console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);
+      }
+      domainToApp.set(normalized, { app, source: filename });
+    });
+  });
+
+  staticAppDescriptors.forEach(({ domains, app, filename }) => {
     domains.forEach((domain) => {
       const normalized = String(domain).trim().toLowerCase();
       if (!normalized) {
@@ -471,9 +771,11 @@ async function main(options = {}) {
   applyConfiguration(options);
 
   const serverDescriptors = await loadServersFromDisk();
-  const domainToApp = buildDomainAppMap(serverDescriptors);
+  const staticDescriptors = loadStaticDescriptors();
+  const staticApps = createStaticAppDescriptors(staticDescriptors);
+  const domainToApp = buildDomainAppMap(serverDescriptors, staticApps);
   const certificateEntries = loadCertificateEntries();
-  writeConfigFile(serverDescriptors, certificateEntries);
+  writeConfigFile(serverDescriptors, staticDescriptors, certificateEntries);
 
   const primaryCert = certificateEntries[0];
   const httpsServer = https.createServer(
@@ -505,6 +807,15 @@ if (require.main === module) {
     process.exit(0);
   }
   applyConfiguration(cliOptions);
+
+  if (cliOptions.writeTemplate) {
+    try {
+      writeTemplateFile(cliOptions.writeTemplate);
+      process.exit(0);
+    } catch (error) {
+      process.exit(1);
+    }
+  }
 
   main().catch((error) => {
     console.error(error.message || error);
