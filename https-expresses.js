@@ -5,8 +5,14 @@ const path = require('path');
 const https = require('https');
 const tls = require('tls');
 const Module = require('module');
+const readline = require('readline');
 const { execSync } = require('child_process');
 const { X509Certificate } = require('crypto');
+
+// Ensure locally installed dependencies are visible when loading modules outside this directory.
+const LOCAL_NODE_MODULES = path.join(__dirname, 'node_modules');
+process.env.NODE_PATH = [LOCAL_NODE_MODULES, process.env.NODE_PATH].filter(Boolean).join(path.delimiter);
+Module._initPaths();
 
 // Default configuration
 const DEFAULT_CONFIG = {
@@ -15,6 +21,8 @@ const DEFAULT_CONFIG = {
   certRoot: '/etc/letsencrypt/live',
   httpsPort: 443,
 };
+
+const CONFIG_PATH = path.join(__dirname, 'https-expresses.cfg');
 
 let SERVERS_PATTERN = new RegExp(DEFAULT_CONFIG.serversPattern);
 let STATIC_PATTERN = new RegExp(DEFAULT_CONFIG.staticPattern);
@@ -158,6 +166,22 @@ function writeTemplateFile(destination) {
   }
 }
 
+async function askYesNo(question, defaultYes = true) {
+  const suffix = defaultYes ? '[Y/n]' : '[y/N]';
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`${question} ${suffix} `, (answer) => {
+      rl.close();
+      const normalized = String(answer || '').trim().toLowerCase();
+      if (!normalized) {
+        resolve(defaultYes);
+        return;
+      }
+      resolve(normalized === 'y' || normalized === 'yes');
+    });
+  });
+}
+
 function parseCliArgs(argv = process.argv.slice(2)) {
   const options = {};
 
@@ -183,6 +207,9 @@ function parseCliArgs(argv = process.argv.slice(2)) {
       case '--static-pattern':
         options.staticPattern = argv[i + 1];
         i += 1;
+        break;
+      case '--update':
+        options.update = true;
         break;
       case '--write-template': {
         const nextVal = argv[i + 1];
@@ -227,6 +254,7 @@ Usage:
   node ${path.basename(__filename)} [options]
 
 Options:
+  --update                  Interactive rescan: add/remove modules/statics and update domains, then exit
   -h, --help                Show this help message
   --https-port <port>       HTTPS port to listen on (default: ${DEFAULT_CONFIG.httpsPort})
   --cert-root <path>        Directory containing certificate folders (default: ${DEFAULT_CONFIG.certRoot})
@@ -235,15 +263,10 @@ Options:
   --write-template [path]   Write a starter template file (default path: template.hts.js) and exit
 
 What it does:
-  - Discovers Express apps from files matching the pattern anywhere under /.
-  - Discovers static site definitions from files matching --static-pattern anywhere under /.
+  - Discovers Express apps from files matching the pattern anywhere under / (use --update to refresh config).
+  - Discovers static site definitions from files matching --static-pattern anywhere under / (use --update to refresh config).
   - Auto-loads certificates from --cert-root and configures SNI.
   - Routes HTTPS traffic by Host header to the matching Express app.
-
-Prerequisites:
-  - Node.js runtime and npm available in PATH.
-  - Certificates laid out like LetsEncrypt under --cert-root (privkey.pem, cert.pem, chain.pem).
-  - Network access to install missing dependencies on first run (auto-installs when possible).
 `;
 
   console.log(usage.trim());
@@ -443,12 +466,43 @@ function loadStaticDescriptors() {
   });
 }
 
+function shouldCompressStatic(req, res) {
+  const noCompression = req.headers['x-no-compression'];
+  if (noCompression) {
+    return false;
+  }
+  const ext = path.extname(req.path || '').toLowerCase();
+  const alreadyCompressed = new Set([
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.ico', '.svg', '.svgz',
+    '.zip', '.gz', '.bz2', '.rar', '.7z',
+    '.mp4', '.webm', '.mov', '.avi', '.mp3', '.ogg', '.wav', '.aac', '.flac',
+    '.pdf'
+  ]);
+  return !alreadyCompressed.has(ext);
+}
+
 function createStaticApp(rootDir) {
   if (!fs.existsSync(rootDir) || !fs.statSync(rootDir).isDirectory()) {
     throw new Error(`Static root ${rootDir} does not exist or is not a directory`);
   }
   const app = express();
-  app.use(compression());
+  app.use(compression({ threshold: 0, filter: shouldCompressStatic }));
+  // Serve index.html for directory requests if present.
+  app.use((req, res, next) => {
+    const cleaned = req.path.replace(/\/+$/, '') || '/';
+    const candidates = ['index.html', 'index.htm', 'default.html', 'default.htm'];
+    for (const file of candidates) {
+      const target =
+        cleaned === '/'
+          ? path.join(rootDir, file)
+          : path.join(rootDir, cleaned, file);
+      if (fs.existsSync(target) && fs.statSync(target).isFile()) {
+        res.sendFile(target);
+        return;
+      }
+    }
+    next();
+  });
   app.use(
     serveStatic(rootDir, {
       fallthrough: true,
@@ -572,13 +626,13 @@ function hasCertificateForDomain(domain, certEntries) {
 }
 
 function writeConfigFile(serverDescriptors, staticDescriptors, certEntries) {
-  const configPath = path.join(__dirname, 'https-expresses.cfg');
   const lines = [];
 
   serverDescriptors.forEach(({ filename, absolutePath, domains }) => {
-    lines.push(filename);
+    const id = absolutePath || path.join(__dirname, filename);
+    lines.push(id);
     lines.push('  type: express');
-    lines.push(`  dir: ${path.dirname(absolutePath || path.join(__dirname, filename))}`);
+    lines.push(`  dir: ${path.dirname(id)}`);
     lines.push('  domains:');
     domains.forEach((domain) => {
       const certStatus = hasCertificateForDomain(domain, certEntries) ? 'present' : 'missing';
@@ -588,9 +642,10 @@ function writeConfigFile(serverDescriptors, staticDescriptors, certEntries) {
   });
 
   staticDescriptors.forEach(({ filename, absolutePath, domains }) => {
-    lines.push(filename);
+    const id = absolutePath || path.join(__dirname, filename);
+    lines.push(id);
     lines.push('  type: static');
-    lines.push(`  dir: ${path.dirname(absolutePath || path.join(__dirname, filename))}`);
+    lines.push(`  dir: ${path.dirname(id)}`);
     lines.push('  domains:');
     if (!domains.length) {
       lines.push('    - (none) (cert: n/a)');
@@ -603,8 +658,234 @@ function writeConfigFile(serverDescriptors, staticDescriptors, certEntries) {
     lines.push('');
   });
 
-  fs.writeFileSync(configPath, lines.join('\n'));
-  console.log(`Wrote config summary to ${configPath}`);
+  fs.writeFileSync(CONFIG_PATH, lines.join('\n'));
+  console.log(`Wrote config summary to ${CONFIG_PATH}`);
+}
+
+function parseConfigFile() {
+  if (!fs.existsSync(CONFIG_PATH)) {
+    return { servers: [], statics: [] };
+  }
+
+  const content = fs.readFileSync(CONFIG_PATH, 'utf8');
+  const lines = content.split(/\r?\n/);
+  const entries = [];
+  let current = null;
+
+  const flush = () => {
+    if (current && current.type && current.id) {
+      current.domains = current.domains || [];
+      entries.push(current);
+    }
+    current = null;
+  };
+
+  lines.forEach((line) => {
+    if (!line.trim()) {
+      flush();
+      return;
+    }
+
+    if (!line.startsWith(' ')) {
+      flush();
+      current = { id: line.trim(), domains: [] };
+      return;
+    }
+
+    const trimmed = line.trim();
+    if (trimmed.startsWith('type:')) {
+      current.type = trimmed.split(':').slice(1).join(':').trim();
+      return;
+    }
+    if (trimmed.startsWith('dir:')) {
+      current.dir = trimmed.split(':').slice(1).join(':').trim();
+      return;
+    }
+    if (trimmed.startsWith('-')) {
+      const domainPart = trimmed.slice(1).trim();
+      const withoutCert = domainPart.replace(/\(cert:.*\)$/i, '').trim();
+      if (withoutCert && withoutCert !== '(none)') {
+        current.domains.push(withoutCert);
+      }
+    }
+  });
+  flush();
+
+  const servers = entries
+    .filter((e) => e.type === 'express' && e.id)
+    .map((e) => {
+      const absolutePath = path.isAbsolute(e.id)
+        ? e.id
+        : e.dir
+        ? path.join(e.dir, e.id)
+        : path.join(__dirname, e.id);
+      return {
+        absolutePath,
+        displayName: path.basename(absolutePath),
+        domains: e.domains || [],
+      };
+    });
+
+  const statics = entries
+    .filter((e) => e.type === 'static' && e.id)
+    .map((e) => {
+      const absolutePath = path.isAbsolute(e.id)
+        ? e.id
+        : e.dir
+        ? path.join(e.dir, e.id)
+        : path.join(__dirname, e.id);
+      return {
+        absolutePath,
+        displayName: path.basename(absolutePath),
+        domains: e.domains || [],
+      };
+    });
+
+  return { servers, statics };
+}
+
+async function reconcileConfigInteractive() {
+  const existing = parseConfigFile();
+  const existingServerMap = new Map(
+    existing.servers.map((s) => [path.normalize(s.absolutePath), s])
+  );
+  const existingStaticMap = new Map(
+    existing.statics.map((s) => [path.normalize(s.absolutePath), s])
+  );
+
+  const finalServers = [];
+  const finalStatics = [];
+  const seenServers = new Set();
+  const seenStatics = new Set();
+
+  const scannedServers = discoverServerModules();
+  for (const spec of scannedServers) {
+    const abs = path.normalize(spec.absolutePath);
+    let descriptor;
+    try {
+      descriptor = await loadServerDescriptor(abs);
+    } catch (error) {
+      console.warn(`Skipping ${abs}: ${error.message}`);
+      continue;
+    }
+
+    seenServers.add(abs);
+    const existingEntry = existingServerMap.get(abs);
+    let domains = descriptor.domains;
+
+    if (existingEntry) {
+      const stored = existingEntry.domains || [];
+      const additions = domains.filter((d) => !stored.includes(d));
+      const removals = stored.filter((d) => !domains.includes(d));
+      if (additions.length || removals.length) {
+        const answer = await askYesNo(
+          `Update domains for ${abs}? existing: [${stored.join(', ')}], current: [${domains.join(', ')}]`,
+          true
+        );
+        if (!answer) {
+          domains = stored;
+        }
+      }
+    } else {
+      const answer = await askYesNo(
+        `Add new Express module ${abs} with domains [${domains.join(', ')}]?`,
+        true
+      );
+      if (!answer) {
+        continue;
+      }
+    }
+
+    finalServers.push({ ...descriptor, filename: spec.displayName, absolutePath: abs, domains });
+  }
+
+  for (const [abs, entry] of existingServerMap.entries()) {
+    if (seenServers.has(abs)) {
+      continue;
+    }
+    const keep = await askYesNo(
+      `Config references ${abs} but it was not found in scan. Keep it?`,
+      false
+    );
+    if (!keep) {
+      continue;
+    }
+    try {
+      const descriptor = await loadServerDescriptor(abs);
+      const domains = (entry.domains && entry.domains.length) ? entry.domains : descriptor.domains;
+      finalServers.push({
+        ...descriptor,
+        filename: entry.displayName || path.basename(abs),
+        absolutePath: abs,
+        domains,
+      });
+    } catch (error) {
+      console.warn(`Skipping ${abs}: ${error.message}`);
+    }
+  }
+
+  const scannedStatics = loadStaticDescriptors();
+  for (const { filename, absolutePath, domains } of scannedStatics) {
+    const abs = path.normalize(absolutePath);
+    seenStatics.add(abs);
+    const existingEntry = existingStaticMap.get(abs);
+    let effectiveDomains = domains;
+
+    if (existingEntry) {
+      const stored = existingEntry.domains || [];
+      const additions = effectiveDomains.filter((d) => !stored.includes(d));
+      const removals = stored.filter((d) => !effectiveDomains.includes(d));
+      if (additions.length || removals.length) {
+        const answer = await askYesNo(
+          `Update domains for static ${abs}? existing: [${stored.join(', ')}], current: [${effectiveDomains.join(', ')}]`,
+          true
+        );
+        if (!answer) {
+          effectiveDomains = stored;
+        }
+      }
+    } else {
+      const answer = await askYesNo(
+        `Add new static definition ${abs} with domains [${effectiveDomains.join(', ')}]?`,
+        true
+      );
+      if (!answer) {
+        continue;
+      }
+    }
+
+    finalStatics.push({
+      type: 'static',
+      filename,
+      absolutePath: abs,
+      domains: effectiveDomains,
+    });
+  }
+
+  for (const [abs, entry] of existingStaticMap.entries()) {
+    if (seenStatics.has(abs)) {
+      continue;
+    }
+    const keep = await askYesNo(
+      `Config references static ${abs} but it was not found in scan. Keep it?`,
+      false
+    );
+    if (!keep) {
+      continue;
+    }
+    let domains = entry.domains || [];
+    if (fs.existsSync(abs)) {
+      domains = parseStaticDomains(abs, path.basename(abs));
+    }
+    finalStatics.push({
+      type: 'static',
+      filename: entry.displayName || path.basename(abs),
+      absolutePath: abs,
+      domains,
+    });
+  }
+
+  return { serverDescriptors: finalServers, staticDescriptors: finalStatics };
 }
 
 function buildDomainAppMap(serverDescriptors, staticAppDescriptors = []) {
@@ -686,14 +967,55 @@ function createRequestHandler(domainToApp) {
 }
 
 async function main(options = {}) {
+  printHelp();
   applyConfiguration(options);
 
-  const serverDescriptors = await loadServersFromDisk();
-  const staticDescriptors = loadStaticDescriptors();
+  if (options.help) {
+    return;
+  }
+
+  const shouldUpdate = options.update || !fs.existsSync(CONFIG_PATH);
+
+  let serverDescriptors = [];
+  let staticDescriptors = [];
+  let certificateEntries = [];
+
+  if (shouldUpdate) {
+    const reconciled = await reconcileConfigInteractive();
+    serverDescriptors = reconciled.serverDescriptors;
+    staticDescriptors = reconciled.staticDescriptors;
+    certificateEntries = loadCertificateEntries();
+    writeConfigFile(serverDescriptors, staticDescriptors, certificateEntries);
+    if (options.update) {
+      console.log('Interactive update complete. Exiting (--update).');
+      return;
+    }
+  } else {
+    const parsed = parseConfigFile();
+    const { servers, statics } = parsed;
+    staticDescriptors = statics.map((entry) => ({
+      type: 'static',
+      filename: entry.displayName,
+      absolutePath: entry.absolutePath,
+      domains: entry.domains || [],
+    }));
+
+    serverDescriptors = [];
+    for (const spec of servers) {
+      try {
+        const descriptor = await loadServerDescriptor(spec.absolutePath);
+        const domains =
+          spec.domains && spec.domains.length ? spec.domains : descriptor.domains;
+        serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
+      } catch (error) {
+        console.warn(`Skipping ${spec.displayName}: ${error.message}`);
+      }
+    }
+    certificateEntries = loadCertificateEntries();
+  }
+
   const staticApps = createStaticAppDescriptors(staticDescriptors);
   const domainToApp = buildDomainAppMap(serverDescriptors, staticApps);
-  const certificateEntries = loadCertificateEntries();
-  writeConfigFile(serverDescriptors, staticDescriptors, certificateEntries);
 
   const primaryCert = certificateEntries[0];
   const httpsServer = https.createServer(
@@ -724,7 +1046,6 @@ if (require.main === module) {
     printHelp();
     process.exit(0);
   }
-  applyConfiguration(cliOptions);
 
   if (cliOptions.writeTemplate) {
     try {
@@ -735,7 +1056,7 @@ if (require.main === module) {
     }
   }
 
-  main().catch((error) => {
+  main(cliOptions).catch((error) => {
     console.error(error.message || error);
     if (error && error.stack) {
       console.error(error.stack);
