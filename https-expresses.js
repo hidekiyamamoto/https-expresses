@@ -1,0 +1,566 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const tls = require('tls');
+const Module = require('module');
+const { execSync } = require('child_process');
+const { X509Certificate } = require('crypto');
+
+// Default configuration
+const DEFAULT_CONFIG = {
+  serversPattern: '.*\\.hts.js$',
+  manualModules: [],
+  certRoot: '/etc/letsencrypt/live',
+  httpsPort: 443,
+};
+
+let SERVERS_PATTERN = new RegExp(DEFAULT_CONFIG.serversPattern);
+let MANUAL_SERVER_MODULES = [...DEFAULT_CONFIG.manualModules];
+let CERT_ROOT = DEFAULT_CONFIG.certRoot;
+let HTTPS_PORT = DEFAULT_CONFIG.httpsPort; // Number(process.env.HTTPS_PORT || 443);
+
+function hasWriteAccess(targetPath) {
+  try {
+    fs.accessSync(targetPath, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attemptInstall(moduleName) {
+  if (!hasWriteAccess(process.cwd())) {
+    throw new Error(
+      `Cannot install missing dependency "${moduleName}" because there is no write access to ${process.cwd()}.`
+    );
+  }
+
+  try {
+    execSync('npm --version', { stdio: 'ignore' });
+  } catch (error) {
+    throw new Error(`Cannot install missing dependency "${moduleName}" because npm is not available.`);
+  }
+
+  console.log(`Auto-installing missing dependency "${moduleName}"...`);
+  execSync(`npm install ${moduleName}`, { stdio: 'inherit' });
+  console.log(`Dependency "${moduleName}" installed.`);
+}
+
+function shouldAutoInstall(error, request) {
+  return (
+    error &&
+    error.code === 'MODULE_NOT_FOUND' &&
+    typeof request === 'string' &&
+    !request.startsWith('.') &&
+    !request.startsWith('/') &&
+    !request.startsWith('node:') &&
+    error.message.includes(`'${request}'`)
+  );
+}
+
+const originalRequire = Module.prototype.require;
+Module.prototype.require = function patchedRequire(request) {
+  try {
+    return originalRequire.apply(this, arguments);
+  } catch (error) {
+    if (shouldAutoInstall(error, request)) {
+      attemptInstall(request);
+      return originalRequire.apply(this, arguments);
+    }
+    throw error;
+  }
+};
+
+function parseCliArgs(argv = process.argv.slice(2)) {
+  const options = {};
+  const manualModules = [];
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    switch (arg) {
+      case '--help':
+      case '-h':
+        options.help = true;
+        break;
+      case '--https-port':
+        options.httpsPort = Number(argv[i + 1]);
+        i += 1;
+        break;
+      case '--cert-root':
+        options.certRoot = argv[i + 1];
+        i += 1;
+        break;
+      case '--manual-module':
+      case '--manual':
+        manualModules.push(argv[i + 1]);
+        i += 1;
+        break;
+      case '--pattern':
+        options.serversPattern = argv[i + 1];
+        i += 1;
+        break;
+      default:
+        // ignore unknown flags for now
+        break;
+    }
+  }
+
+  if (manualModules.length) {
+    options.manualModules = manualModules.filter(Boolean);
+  }
+  return options;
+}
+
+function applyConfiguration(overrides = {}) {
+  if (overrides.serversPattern) {
+    SERVERS_PATTERN = new RegExp(overrides.serversPattern);
+  }
+
+  if (Array.isArray(overrides.manualModules)) {
+    const combinedManual = [...DEFAULT_CONFIG.manualModules, ...overrides.manualModules].filter(Boolean);
+    // Normalize and deduplicate manual module paths
+    const seen = new Set();
+    MANUAL_SERVER_MODULES = combinedManual.filter((entry) => {
+      const normalized = path.normalize(entry);
+      if (seen.has(normalized)) {
+        return false;
+      }
+      seen.add(normalized);
+      return true;
+    });
+  }
+
+  if (overrides.certRoot) {
+    CERT_ROOT = overrides.certRoot;
+  }
+
+  if (typeof overrides.httpsPort === 'number' && !Number.isNaN(overrides.httpsPort)) {
+    HTTPS_PORT = overrides.httpsPort;
+  }
+}
+
+function printHelp() {
+  const usage = `
+Usage:
+  node ${path.basename(__filename)} [options]
+
+Options:
+  -h, --help                Show this help message
+  --https-port <port>       HTTPS port to listen on (default: ${DEFAULT_CONFIG.httpsPort})
+  --cert-root <path>        Directory containing certificate folders (default: ${DEFAULT_CONFIG.certRoot})
+  --pattern <regex>         Regex for auto-loading server modules (default: ${DEFAULT_CONFIG.serversPattern})
+  --manual-module <path>    Extra module path(s) to load; repeatable (default: ${DEFAULT_CONFIG.manualModules.join(', ')})
+
+What it does:
+  - Discovers Express apps from files matching the pattern and manual module list.
+  - Auto-loads certificates from --cert-root and configures SNI.
+  - Routes HTTPS traffic by Host header to the matching Express app.
+
+Prerequisites:
+  - Node.js runtime and npm available in PATH.
+  - Certificates laid out like LetsEncrypt under --cert-root (privkey.pem, cert.pem, chain.pem).
+  - Network access to install missing dependencies on first run (auto-installs when possible).
+`;
+
+  console.log(usage.trim());
+}
+
+function discoverServerModules() {
+  const directoryEntries = fs.readdirSync(__dirname, { withFileTypes: true });
+  return directoryEntries
+    .filter((entry) => entry.isFile() && SERVERS_PATTERN.test(entry.name))
+    .map((entry) => entry.name);
+}
+
+async function loadServerDescriptor(modulePath) {
+  const rawExport = require(modulePath);
+
+  let initializer;
+  let initializerContext;
+
+  if (typeof rawExport === 'function') {
+    initializer = rawExport;
+  } else if (rawExport && typeof rawExport === 'object' && typeof rawExport.init === 'function') {
+    initializer = rawExport.init;
+    initializerContext = rawExport;
+  } else if (rawExport && typeof rawExport === 'object' && typeof rawExport.initialize === 'function') {
+    initializer = rawExport.initialize;
+    initializerContext = rawExport;
+  } else {
+    throw new Error(
+      `Module ${path.basename(modulePath)} must export an async init() function or be itself an async initializer.`
+    );
+  }
+
+  // Extract OpenAPI configuration BEFORE calling init()
+  const openapiConfig = rawExport.openapi;
+
+  let candidate;
+  try {
+    // Pass OpenAPI helper to the module so it can apply validation early
+    const openapiHelper = createOpenApiHelper(modulePath);
+    candidate = await initializer.call(initializerContext, { openapiHelper, openapiConfig });
+  } catch (error) {
+    const enriched = new Error(
+      `Module ${path.basename(modulePath)} failed during async init: ${error.message}`
+    );
+    enriched.cause = error;
+    throw enriched;
+  }
+
+  if (!candidate || typeof candidate !== 'object') {
+    throw new Error(`Module ${path.basename(modulePath)} must resolve to an object descriptor from init().`);
+  }
+
+  const app = candidate.app || candidate.expressApp || candidate.handler;
+  if (typeof app !== 'function') {
+    throw new Error(
+      `Module ${path.basename(modulePath)} must provide an Express app via init() -> app/expressApp/handler.`
+    );
+  }
+
+  const exportedDomains =
+    candidate.domains ||
+    candidate.domain ||
+    candidate.hosts ||
+    candidate.host ||
+    (rawExport && typeof rawExport === 'object'
+      ? rawExport.domains || rawExport.domain || rawExport.hosts || rawExport.host
+      : undefined);
+  const domains = Array.isArray(exportedDomains)
+    ? exportedDomains
+    : exportedDomains
+    ? [exportedDomains]
+    : [];
+  if (!domains.length) {
+    throw new Error(`Module ${path.basename(modulePath)} must declare at least one domain.`);
+  }
+
+  // OpenAPI validation is now applied by the module itself using the helper
+
+  const metaSources = [];
+  if (rawExport && typeof rawExport === 'object' && rawExport.meta && typeof rawExport.meta === 'object') {
+    metaSources.push(rawExport.meta);
+  }
+  if (candidate.meta && typeof candidate.meta === 'object') {
+    metaSources.push(candidate.meta);
+  }
+  const meta = metaSources.reduce((acc, fragment) => Object.assign(acc, fragment), {});
+
+  return { app, domains, meta, openapi: !!openapiConfig };
+}
+
+async function loadServersFromDisk() {
+  const discovered = discoverServerModules().map((filename) => ({
+    absolutePath: path.join(__dirname, filename),
+    displayName: filename,
+  }));
+
+  const manual = MANUAL_SERVER_MODULES.map((modulePath) => {
+    const absolutePath = path.isAbsolute(modulePath)
+      ? modulePath
+      : path.join(__dirname, modulePath);
+    const displayName = path.relative(__dirname, absolutePath) || path.basename(absolutePath);
+    return { absolutePath, displayName };
+  });
+
+  const moduleSpecs = [];
+  const seen = new Set();
+
+  [...manual, ...discovered].forEach((spec) => {
+    const normalized = path.normalize(spec.absolutePath);
+    if (seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    moduleSpecs.push({ ...spec, absolutePath: normalized });
+  });
+
+  if (!moduleSpecs.length) {
+    throw new Error('No server modules matching k30-server-*.js were found in this directory.');
+  }
+
+  const serverDescriptors = [];
+  for (const { absolutePath, displayName } of moduleSpecs) {
+    const descriptor = await loadServerDescriptor(absolutePath);
+    serverDescriptors.push({ ...descriptor, filename: displayName, absolutePath });
+  }
+
+  return serverDescriptors;
+}
+
+function readFileIfExists(filePath) {
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath) : undefined;
+}
+
+function parseCertificateDomains(certBuffer, fallbackDomain) {
+  if (!certBuffer) {
+    return fallbackDomain ? [fallbackDomain] : [];
+  }
+
+  try {
+    const certificate = new X509Certificate(certBuffer);
+    const altNames = certificate.subjectAltName
+      ? certificate.subjectAltName
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter((entry) => entry.startsWith('DNS:'))
+          .map((entry) => entry.slice(4).toLowerCase())
+      : [];
+
+    if (altNames.length) {
+      return altNames;
+    }
+  } catch (error) {
+    console.warn(`Could not parse certificate SANs for ${fallbackDomain}: ${error.message}`);
+  }
+
+  return fallbackDomain ? [fallbackDomain.toLowerCase()] : [];
+}
+
+async function applyOpenApiValidation(app, openapiConfig, modulePath) {
+  if (!openapiConfig) {
+    return app; // No OpenAPI validation needed
+  }
+
+  try {
+    let specPath, options = {};
+
+    if (typeof openapiConfig === 'string') {
+      specPath = path.isAbsolute(openapiConfig)
+        ? openapiConfig
+        : path.join(path.dirname(modulePath), openapiConfig);
+    } else if (typeof openapiConfig === 'object') {
+      specPath = path.isAbsolute(openapiConfig.spec)
+        ? openapiConfig.spec
+        : path.join(path.dirname(modulePath), openapiConfig.spec);
+      options = openapiConfig.options || {};
+    } else {
+      throw new Error('Invalid OpenAPI configuration');
+    }
+
+    if (!fs.existsSync(specPath)) {
+      throw new Error(`OpenAPI spec file not found: ${specPath}`);
+    }
+
+    // Apply OpenAPI validator middleware
+    app.use(
+      OpenApiValidator.middleware({
+        apiSpec: specPath,
+        validateRequests: true,
+        validateResponses: false, // Optional: set to true for response validation
+        ...options
+      })
+    );
+
+    // Add OpenAPI error handler
+    app.use((err, req, res, next) => {
+      if (err.status && err.errors) {
+        // This is an OpenAPI validation error
+        res.status(err.status).json({
+          error: 'Validation Error',
+          message: err.message,
+          details: err.errors
+        });
+        return;
+      }
+      next(err);
+    });
+
+    console.log(`OpenAPI validation enabled for module: ${path.basename(modulePath)}`);
+
+  } catch (error) {
+    console.error(`Failed to apply OpenAPI validation for ${path.basename(modulePath)}:`, error.message);
+    throw error;
+  }
+
+  return app;
+}
+
+function loadCertificateEntries() {
+  if (!fs.existsSync(CERT_ROOT)) {
+    throw new Error(`Certificate directory ${CERT_ROOT} does not exist.`);
+  }
+
+  const directories = fs.readdirSync(CERT_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  if (!directories.length) {
+    throw new Error(`No certificates found under ${CERT_ROOT}.`);
+  }
+
+  const entries = directories.map((entry) => {
+    const certDir = path.join(CERT_ROOT, entry.name);
+    const keyPath = path.join(certDir, 'privkey.pem');
+    const certPath = path.join(certDir, 'cert.pem');
+    const chainPath = path.join(certDir, 'chain.pem');
+
+    const key = readFileIfExists(keyPath);
+    const cert = readFileIfExists(certPath);
+    const ca = readFileIfExists(chainPath);
+
+    if (!key || !cert) {
+      throw new Error(`Missing key or certificate in ${certDir}.`);
+    }
+
+    const domains = parseCertificateDomains(cert, entry.name);
+    return { key, cert, ca, domains, source: certDir };
+  });
+
+  return entries;
+}
+
+function domainMatchesPattern(domain, pattern) {
+  const d = String(domain || '').toLowerCase();
+  const p = String(pattern || '').toLowerCase();
+
+  if (!d || !p) {
+    return false;
+  }
+
+  if (p.startsWith('*.')) {
+    const suffix = p.slice(1); // keep the leading dot for clarity
+    return d.endsWith(suffix) && d.length > suffix.length;
+  }
+
+  return d === p;
+}
+
+function hasCertificateForDomain(domain, certEntries) {
+  return certEntries.some(({ domains }) => domains.some((pattern) => domainMatchesPattern(domain, pattern)));
+}
+
+function writeConfigFile(serverDescriptors, certEntries) {
+  const configPath = path.join(__dirname, 'https-expresses.cfg');
+  const lines = [];
+
+  serverDescriptors.forEach(({ filename, absolutePath, domains }) => {
+    lines.push(filename);
+    lines.push('  type: express');
+    lines.push(`  dir: ${path.dirname(absolutePath || path.join(__dirname, filename))}`);
+    lines.push('  domains:');
+    domains.forEach((domain) => {
+      const certStatus = hasCertificateForDomain(domain, certEntries) ? 'present' : 'missing';
+      lines.push(`    - ${domain} (cert: ${certStatus})`);
+    });
+    lines.push('');
+  });
+
+  fs.writeFileSync(configPath, lines.join('\n'));
+  console.log(`Wrote config summary to ${configPath}`);
+}
+
+function buildDomainAppMap(serverDescriptors) {
+  const domainToApp = new Map();
+
+  serverDescriptors.forEach(({ domains, app, filename }) => {
+    domains.forEach((domain) => {
+      const normalized = String(domain).trim().toLowerCase();
+      if (!normalized) {
+        return;
+      }
+      if (domainToApp.has(normalized)) {
+        console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);
+      }
+      domainToApp.set(normalized, { app, source: filename });
+    });
+  });
+
+  return domainToApp;
+}
+
+function attachCertificateContexts(server, certEntries) {
+  const assigned = new Set();
+
+  certEntries.forEach(({ key, cert, ca, domains, source }) => {
+    domains.forEach((domain) => {
+      const normalized = domain.trim().toLowerCase();
+      if (!normalized || assigned.has(normalized)) {
+        return;
+      }
+      const context = tls.createSecureContext({ key, cert, ca });
+      server.addContext(normalized, context);
+      assigned.add(normalized);
+    });
+
+    if (!domains.length) {
+      console.warn(`No domains determined for certificate in ${source}; skipping addContext.`);
+    }
+  });
+}
+
+function createRequestHandler(domainToApp) {
+  return function httpsRequestHandler(req, res) {
+    const hostHeader = req.headers.host || '';
+    const hostname = hostHeader.split(':')[0].toLowerCase();
+    const mapping = domainToApp.get(hostname);
+
+    if (!mapping) {
+      res.statusCode = 502;
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end('No application configured for this domain.');
+      return;
+    }
+
+    try {
+      mapping.app(req, res);
+    } catch (error) {
+      console.error(`Error handling request for ${hostname} via ${mapping.source}:`, error);
+      if (!res.headersSent) {
+        res.statusCode = 500;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      }
+      res.end('Internal server error.');
+    }
+  };
+}
+
+async function main(options = {}) {
+  applyConfiguration(options);
+
+  const serverDescriptors = await loadServersFromDisk();
+  const domainToApp = buildDomainAppMap(serverDescriptors);
+  const certificateEntries = loadCertificateEntries();
+  writeConfigFile(serverDescriptors, certificateEntries);
+
+  const primaryCert = certificateEntries[0];
+  const httpsServer = https.createServer(
+    {
+      key: primaryCert.key,
+      cert: primaryCert.cert,
+      ca: primaryCert.ca,
+    },
+    createRequestHandler(domainToApp)
+  );
+
+  attachCertificateContexts(httpsServer, certificateEntries);
+
+  httpsServer.on('listening', () => {
+    console.log(`HTTPS server listening on port ${HTTPS_PORT}.`);
+  });
+
+  httpsServer.on('error', (error) => {
+    console.error('HTTPS server encountered an error:', error);
+  });
+
+  httpsServer.listen(HTTPS_PORT);
+}
+
+if (require.main === module) {
+  const cliOptions = parseCliArgs(process.argv.slice(2));
+  if (cliOptions.help) {
+    printHelp();
+    process.exit(0);
+  }
+  applyConfiguration(cliOptions);
+
+  main().catch((error) => {
+    console.error(error.message || error);
+    if (error && error.stack) {
+      console.error(error.stack);
+    }
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { main };
