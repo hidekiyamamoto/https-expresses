@@ -11,6 +11,7 @@ const { X509Certificate } = require('crypto');
 // Default configuration
 const DEFAULT_CONFIG = {
   serversPattern: '.*\\.hts.js$',
+  staticPattern: '.*\\.hts.txt$',
   manualModules: [],
   certRoot: '/etc/letsencrypt/live',
   httpsPort: 443,
@@ -72,6 +73,23 @@ Module.prototype.require = function patchedRequire(request) {
     throw error;
   }
 };
+
+function loadExternalModule(name) {
+  try {
+    return require(name);
+  } catch (error) {
+    // The patched require should already try auto-install; this is a final fallback.
+    if (shouldAutoInstall(error, name)) {
+      attemptInstall(name);
+      return require(name);
+    }
+    throw error;
+  }
+}
+
+const express = loadExternalModule('express');
+const serveStatic = loadExternalModule('serve-static');
+const compression = loadExternalModule('compression');
 
 function parseCliArgs(argv = process.argv.slice(2)) {
   const options = {};
@@ -194,14 +212,9 @@ async function loadServerDescriptor(modulePath) {
     );
   }
 
-  // Extract OpenAPI configuration BEFORE calling init()
-  const openapiConfig = rawExport.openapi;
-
   let candidate;
   try {
-    // Pass OpenAPI helper to the module so it can apply validation early
-    const openapiHelper = createOpenApiHelper(modulePath);
-    candidate = await initializer.call(initializerContext, { openapiHelper, openapiConfig });
+    candidate = await initializer.call(initializerContext);
   } catch (error) {
     const enriched = new Error(
       `Module ${path.basename(modulePath)} failed during async init: ${error.message}`
@@ -238,8 +251,6 @@ async function loadServerDescriptor(modulePath) {
     throw new Error(`Module ${path.basename(modulePath)} must declare at least one domain.`);
   }
 
-  // OpenAPI validation is now applied by the module itself using the helper
-
   const metaSources = [];
   if (rawExport && typeof rawExport === 'object' && rawExport.meta && typeof rawExport.meta === 'object') {
     metaSources.push(rawExport.meta);
@@ -249,7 +260,7 @@ async function loadServerDescriptor(modulePath) {
   }
   const meta = metaSources.reduce((acc, fragment) => Object.assign(acc, fragment), {});
 
-  return { app, domains, meta, openapi: !!openapiConfig };
+  return { app, domains, meta };
 }
 
 async function loadServersFromDisk() {
@@ -279,7 +290,7 @@ async function loadServersFromDisk() {
   });
 
   if (!moduleSpecs.length) {
-    throw new Error('No server modules matching k30-server-*.js were found in this directory.');
+    throw new Error('No server modules matching hts.js were found in this directory.');
   }
 
   const serverDescriptors = [];
@@ -318,65 +329,6 @@ function parseCertificateDomains(certBuffer, fallbackDomain) {
   }
 
   return fallbackDomain ? [fallbackDomain.toLowerCase()] : [];
-}
-
-async function applyOpenApiValidation(app, openapiConfig, modulePath) {
-  if (!openapiConfig) {
-    return app; // No OpenAPI validation needed
-  }
-
-  try {
-    let specPath, options = {};
-
-    if (typeof openapiConfig === 'string') {
-      specPath = path.isAbsolute(openapiConfig)
-        ? openapiConfig
-        : path.join(path.dirname(modulePath), openapiConfig);
-    } else if (typeof openapiConfig === 'object') {
-      specPath = path.isAbsolute(openapiConfig.spec)
-        ? openapiConfig.spec
-        : path.join(path.dirname(modulePath), openapiConfig.spec);
-      options = openapiConfig.options || {};
-    } else {
-      throw new Error('Invalid OpenAPI configuration');
-    }
-
-    if (!fs.existsSync(specPath)) {
-      throw new Error(`OpenAPI spec file not found: ${specPath}`);
-    }
-
-    // Apply OpenAPI validator middleware
-    app.use(
-      OpenApiValidator.middleware({
-        apiSpec: specPath,
-        validateRequests: true,
-        validateResponses: false, // Optional: set to true for response validation
-        ...options
-      })
-    );
-
-    // Add OpenAPI error handler
-    app.use((err, req, res, next) => {
-      if (err.status && err.errors) {
-        // This is an OpenAPI validation error
-        res.status(err.status).json({
-          error: 'Validation Error',
-          message: err.message,
-          details: err.errors
-        });
-        return;
-      }
-      next(err);
-    });
-
-    console.log(`OpenAPI validation enabled for module: ${path.basename(modulePath)}`);
-
-  } catch (error) {
-    console.error(`Failed to apply OpenAPI validation for ${path.basename(modulePath)}:`, error.message);
-    throw error;
-  }
-
-  return app;
 }
 
 function loadCertificateEntries() {
