@@ -21,11 +21,11 @@ Think of it as a tiny, Node‑native front door in front of all your Express app
 From the `https-expresses.js` folder:
 
 ```bash
-node https-expresses.js --https-port 443
+node https-expresses.js
 ```
 
 On start it will:
-
+- Print help
 - Load certificates from `/etc/letsencrypt/live` (or `--cert-root`).
 - Load app modules and statics from the existing `https-expresses.cfg` (see below).
 - For any domain with a valid cert, add:
