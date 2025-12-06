@@ -12,16 +12,12 @@ const { X509Certificate } = require('crypto');
 const DEFAULT_CONFIG = {
   serversPattern: '.*\\.hts.js$',
   staticPattern: '.*\\.hts.txt$',
-  staticDirs: [],
-  manualModules: [],
   certRoot: '/etc/letsencrypt/live',
   httpsPort: 443,
 };
 
 let SERVERS_PATTERN = new RegExp(DEFAULT_CONFIG.serversPattern);
 let STATIC_PATTERN = new RegExp(DEFAULT_CONFIG.staticPattern);
-let STATIC_DIRS = [...DEFAULT_CONFIG.staticDirs];
-let MANUAL_SERVER_MODULES = [...DEFAULT_CONFIG.manualModules];
 let CERT_ROOT = DEFAULT_CONFIG.certRoot;
 let HTTPS_PORT = DEFAULT_CONFIG.httpsPort; // Number(process.env.HTTPS_PORT || 443);
 
@@ -164,8 +160,6 @@ function writeTemplateFile(destination) {
 
 function parseCliArgs(argv = process.argv.slice(2)) {
   const options = {};
-  const manualModules = [];
-  const staticDirs = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -182,21 +176,12 @@ function parseCliArgs(argv = process.argv.slice(2)) {
         options.certRoot = argv[i + 1];
         i += 1;
         break;
-      case '--manual-module':
-      case '--manual':
-        manualModules.push(argv[i + 1]);
-        i += 1;
-        break;
       case '--pattern':
         options.serversPattern = argv[i + 1];
         i += 1;
         break;
       case '--static-pattern':
         options.staticPattern = argv[i + 1];
-        i += 1;
-        break;
-      case '--static-dir':
-        staticDirs.push(argv[i + 1]);
         i += 1;
         break;
       case '--write-template': {
@@ -215,12 +200,6 @@ function parseCliArgs(argv = process.argv.slice(2)) {
     }
   }
 
-  if (manualModules.length) {
-    options.manualModules = manualModules.filter(Boolean);
-  }
-  if (staticDirs.length) {
-    options.staticDirs = staticDirs.filter(Boolean);
-  }
   return options;
 }
 
@@ -231,35 +210,6 @@ function applyConfiguration(overrides = {}) {
 
   if (overrides.staticPattern) {
     STATIC_PATTERN = new RegExp(overrides.staticPattern);
-  }
-
-  if (Array.isArray(overrides.staticDirs)) {
-    const combinedDirs = [...DEFAULT_CONFIG.staticDirs, ...overrides.staticDirs].filter(Boolean);
-    const seenDirs = new Set();
-    STATIC_DIRS = combinedDirs
-      .map((dir) => (path.isAbsolute(dir) ? dir : path.join(__dirname, dir)))
-      .map((dir) => path.normalize(dir))
-      .filter((dir) => {
-        if (seenDirs.has(dir)) {
-          return false;
-        }
-        seenDirs.add(dir);
-        return true;
-      });
-  }
-
-  if (Array.isArray(overrides.manualModules)) {
-    const combinedManual = [...DEFAULT_CONFIG.manualModules, ...overrides.manualModules].filter(Boolean);
-    // Normalize and deduplicate manual module paths
-    const seen = new Set();
-    MANUAL_SERVER_MODULES = combinedManual.filter((entry) => {
-      const normalized = path.normalize(entry);
-      if (seen.has(normalized)) {
-        return false;
-      }
-      seen.add(normalized);
-      return true;
-    });
   }
 
   if (overrides.certRoot) {
@@ -282,13 +232,11 @@ Options:
   --cert-root <path>        Directory containing certificate folders (default: ${DEFAULT_CONFIG.certRoot})
   --pattern <regex>         Regex for auto-loading server modules (default: ${DEFAULT_CONFIG.serversPattern})
   --static-pattern <regex>  Regex for auto-loading static definitions (default: ${DEFAULT_CONFIG.staticPattern})
-  --static-dir <path>       Extra directory to scan for static definitions; repeatable (default: ${DEFAULT_CONFIG.staticDirs.join(', ') || 'none'})
-  --manual-module <path>    Extra module path(s) to load; repeatable (default: ${DEFAULT_CONFIG.manualModules.join(', ')})
   --write-template [path]   Write a starter template file (default path: template.hts.js) and exit
 
 What it does:
-  - Discovers Express apps from files matching the pattern and manual module list.
-  - Discovers static site definitions from files matching --static-pattern.
+  - Discovers Express apps from files matching the pattern anywhere under /.
+  - Discovers static site definitions from files matching --static-pattern anywhere under /.
   - Auto-loads certificates from --cert-root and configures SNI.
   - Routes HTTPS traffic by Host header to the matching Express app.
 
@@ -301,53 +249,47 @@ Prerequisites:
   console.log(usage.trim());
 }
 
+function walkMatchingFiles({ root = '/', pattern }) {
+  const matches = new Set();
+  const skipDirs = new Set(['node_modules', '.git', '.hg', '.svn']);
+  const stack = [path.normalize(root)];
+
+  while (stack.length) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (error) {
+      // skip unreadable dirs
+      continue;
+    }
+
+    entries.forEach((entry) => {
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (!skipDirs.has(entry.name)) {
+          stack.push(fullPath);
+        }
+        return;
+      }
+      if (entry.isFile() && pattern.test(entry.name)) {
+        matches.add(path.normalize(fullPath));
+      }
+    });
+  }
+
+  return Array.from(matches);
+}
+
 function discoverServerModules() {
-  const directoryEntries = fs.readdirSync(__dirname, { withFileTypes: true });
-  return directoryEntries
-    .filter((entry) => entry.isFile() && SERVERS_PATTERN.test(entry.name))
-    .map((entry) => entry.name);
+  return walkMatchingFiles({ root: '/', pattern: SERVERS_PATTERN }).map((absolutePath) => ({
+    absolutePath,
+    displayName: path.basename(absolutePath),
+  }));
 }
 
 function discoverStaticFiles() {
-  const matches = new Set();
-  const skipDirs = new Set(['node_modules', '.git', '.hg', '.svn']);
-
-  const roots = STATIC_DIRS.length ? STATIC_DIRS : ['/'];
-
-  roots.forEach((root) => {
-    const rootPath = path.normalize(root);
-    if (!fs.existsSync(rootPath) || !fs.statSync(rootPath).isDirectory()) {
-      console.warn(`Static dir ${rootPath} does not exist or is not a directory; skipping.`);
-      return;
-    }
-
-    const stack = [rootPath];
-    while (stack.length) {
-      const current = stack.pop();
-      let entries;
-      try {
-        entries = fs.readdirSync(current, { withFileTypes: true });
-      } catch (error) {
-        console.warn(`Could not read directory ${current}: ${error.message}`);
-        continue;
-      }
-
-      entries.forEach((entry) => {
-        const fullPath = path.join(current, entry.name);
-        if (entry.isDirectory()) {
-          if (!skipDirs.has(entry.name)) {
-            stack.push(fullPath);
-          }
-          return;
-        }
-        if (entry.isFile() && STATIC_PATTERN.test(entry.name)) {
-          matches.add(path.normalize(fullPath));
-        }
-      });
-    }
-  });
-
-  return Array.from(matches).map((absolutePath) => ({
+  return walkMatchingFiles({ root: '/', pattern: STATIC_PATTERN }).map((absolutePath) => ({
     absolutePath,
     displayName: path.basename(absolutePath),
   }));
@@ -534,34 +476,10 @@ function createStaticAppDescriptors(staticDescriptors) {
 }
 
 async function loadServersFromDisk() {
-  const discovered = discoverServerModules().map((filename) => ({
-    absolutePath: path.join(__dirname, filename),
-    displayName: filename,
-  }));
-
-  const manual = MANUAL_SERVER_MODULES.map((modulePath) => {
-    const absolutePath = path.isAbsolute(modulePath)
-      ? modulePath
-      : path.join(__dirname, modulePath);
-    const displayName = path.relative(__dirname, absolutePath) || path.basename(absolutePath);
-    return { absolutePath, displayName };
-  });
-
-  const moduleSpecs = [];
-  const seen = new Set();
-
-  [...manual, ...discovered].forEach((spec) => {
-    const normalized = path.normalize(spec.absolutePath);
-    if (seen.has(normalized)) {
-      return;
-    }
-    seen.add(normalized);
-    moduleSpecs.push({ ...spec, absolutePath: normalized });
-  });
+  const moduleSpecs = discoverServerModules();
 
   if (!moduleSpecs.length) {
-    console.error('No server modules matching hts.js were found in this directory.');
-    //throw new Error('No server modules matching hts.js were found in this directory.');
+    console.error('No server modules matching hts.js were found in the filesystem.');
   }
 
   const serverDescriptors = [];
