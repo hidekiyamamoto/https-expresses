@@ -940,11 +940,29 @@ function attachCertificateContexts(server, certEntries) {
   });
 }
 
-function createRequestHandler(domainToApp) {
+function buildCertDomainSet(certEntries) {
+  const set = new Set();
+  certEntries.forEach(({ domains }) => {
+    (domains || []).forEach((d) => {
+      const normalized = String(d || '').trim().toLowerCase();
+      if (normalized) {
+        set.add(normalized);
+      }
+    });
+  });
+  return set;
+}
+
+function createRequestHandler(domainToApp, certDomainSet = new Set()) {
   return function httpsRequestHandler(req, res) {
     const hostHeader = req.headers.host || '';
     const hostname = hostHeader.split(':')[0].toLowerCase();
     const mapping = domainToApp.get(hostname);
+
+    if (certDomainSet.has(hostname)) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+      res.setHeader('Content-Security-Policy', 'upgrade-insecure-requests');
+    }
 
     if (!mapping) {
       res.statusCode = 502;
@@ -1016,6 +1034,7 @@ async function main(options = {}) {
 
   const staticApps = createStaticAppDescriptors(staticDescriptors);
   const domainToApp = buildDomainAppMap(serverDescriptors, staticApps);
+  const certDomainSet = buildCertDomainSet(certificateEntries);
 
   const primaryCert = certificateEntries[0];
   const httpsServer = https.createServer(
@@ -1024,7 +1043,7 @@ async function main(options = {}) {
       cert: primaryCert.cert,
       ca: primaryCert.ca,
     },
-    createRequestHandler(domainToApp)
+    createRequestHandler(domainToApp, certDomainSet)
   );
 
   attachCertificateContexts(httpsServer, certificateEntries);
