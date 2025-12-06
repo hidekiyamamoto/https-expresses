@@ -1,0 +1,4 @@
+
+# Local deps and generated configs
+node_modules/
+*.cfg
