@@ -1,8 +1,8 @@
 # https-expresses.js
 
-Multi‑domain HTTPS router for Express apps and static sites, using SNI and a tiny file convention.
+A Node.js HTTPS server to run all your Express apps on multiple domains, each with its own certificate (and optional static sites) using a tiny file convention.
 
-> Short pitch: **“One HTTPS port, many domains, zero Nginx.”**
+> Short pitch: **“One HTTPS server, many Express apps, per‑domain certs.”**
 
 ## What this thing does
 
@@ -151,4 +151,3 @@ Help is printed automatically at startup so you don’t forget what’s availabl
 - The design assumes you’re comfortable editing text files and saying “y/n” in a terminal. If you prefer GUIs, this probably isn’t your router.
 
 That’s it: one process, many domains, and a simple contract for your apps and static sites.
-
