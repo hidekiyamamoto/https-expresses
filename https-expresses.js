@@ -33,22 +33,21 @@ let HTTPS_PORT = DEFAULT_CONFIG.httpsPort; // Number(process.env.HTTPS_PORT || 4
 
 
 /* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
+/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # HELPERS - START */
 function readFileIfExists(filePath) {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath) : undefined;
 }
 function hasWriteAccess(targetPath) {
   try {fs.accessSync(targetPath, fs.constants.W_OK);return true;} catch {return false;}
 }
-
-
+/* HELPERS - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
+/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # PREREQUISITES AUTOINSTALL - START */
 function attemptInstall(moduleName) {
   if (!hasWriteAccess(process.cwd())) {
     throw new Error(`Cannot install missing dependency "${moduleName}" because there is no write access to ${process.cwd()}.`);
   }
-
   try {execSync('npm --version', { stdio: 'ignore' });}
   catch (error) {throw new Error(`Cannot install missing dependency "${moduleName}" because npm is not available.`);}
-
   console.log(`Auto-installing missing dependency "${moduleName}"...`);
   execSync(`npm install ${moduleName}`, { stdio: 'inherit' });
   console.log(`Dependency "${moduleName}" installed.`);
@@ -121,25 +120,26 @@ module.exports={
   }
 };`,
 HELP_TEXT:`
+################################################################
 Usage:
   node ${path.basename(__filename)} [options]
-
 Options:
   --update                  Interactive rescan: add/remove modules/statics and update domains, then exit
-  -h, --help                Show this help message
+  --help                    Show this help message
   --https-port <port>       HTTPS port to listen on (default: ${DEFAULT_CONFIG.httpsPort})
   --cert-root <path>        Directory containing certificate folders (default: ${DEFAULT_CONFIG.certRoot})
   --pattern <regex>         Regex for auto-loading server modules (default: ${DEFAULT_CONFIG.serversPattern})
   --static-pattern <regex>  Regex for auto-loading static definitions (default: ${DEFAULT_CONFIG.staticPattern})
+  --proxy-pattern <regex>   Regex for auto-loading proxy definitions (default: ${DEFAULT_CONFIG.proxyPattern})
   --write-template [path]   Write a starter template file (default path: template.hts.js) and exit
 
 What it does:
   - Discovers Express apps from files matching the pattern anywhere under / (use --update to refresh config).
   - Discovers static site definitions from files matching --static-pattern anywhere under / (use --update to refresh config).
   - Auto-loads certificates from --cert-root and configures SNI.
-  - Routes HTTPS traffic by Host header to the matching Express app.
+  - Routes HTTPS traffic by Host header to the matching Express app, static files or proxies.
+################################################################
 `
-
 };
 
 const express = loadExternalModule('express');
@@ -414,18 +414,6 @@ function loadDescriptorsOfKind(kind,PATTERN) {
     return {type:kind,filename:displayName,absolutePath,domains,target};
   });
 }
-function loadStaticDescriptors() {
-  const discovered = discoverFiles(STATIC_PATTERN);
-  return discovered.map(({ absolutePath, displayName }) => {
-    const domains = parseStaticAndProxiesDomains(absolutePath, displayName, 'static');
-    return {
-      type: 'static',
-      filename: displayName,
-      absolutePath,
-      domains,
-    };
-  });
-}
 /* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
 /* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # INTEGRATED APPS - START */
 function createAppOfKind(parameter,kind){
@@ -636,12 +624,10 @@ function parseConfigFile() {
           target: e.target,
         };
       });
-
   const servers = mapEntries('express');
   const statics = mapEntries('static');
   const proxies = mapEntries('proxy');
-
-  return { servers, statics, proxies };
+  return {servers,statics,proxies };
 }
 
 async function reconcileDescriptors({
@@ -668,78 +654,53 @@ async function reconcileDescriptors({
           `Update domains for ${label} ${abs}? existing: [${stored.join(', ')}], current: [${effectiveDomains.join(', ')}]`,
           true
         );
-        if (!answer) {
-          effectiveDomains = stored;
-        }
+        if(!answer){effectiveDomains=stored;}
       }
     } else {
       const answer = await askYesNo(
         `Add new ${label} definition ${abs} with domains [${effectiveDomains.join(', ')}]?`,
         true
       );
-      if (!answer) {
-        continue;
-      }
+      if(!answer){continue;}
     }
 
-    finalList.push({
-      type,
-      filename,
-      absolutePath: abs,
-      domains: effectiveDomains,
-    });
+    finalList.push({type,filename,absolutePath:abs,domains:effectiveDomains,target});
   }
 
   for (const [abs, entry] of existingMap.entries()) {
-    if (seenSet.has(abs)) {
-      continue;
-    }
+    if(seenSet.has(abs)){continue;}
     const keep = await askYesNo(
       `Config references ${label} ${abs} but it was not found in scan. Keep it?`,
       false
     );
-    if (!keep) {
-      continue;
-    }
+    if(!keep){continue;}
     let domains = entry.domains || [];
-    if (fs.existsSync(abs)) {
-      domains = parseDomainsFromDisk(abs);
-    }
+    if(fs.existsSync(abs)){domains=parseDomainsFromDisk(abs);}
     finalList.push({
       type,
       filename: entry.displayName || path.basename(abs),
       absolutePath: abs,
-      domains,
+      domains,target
     });
   }
 }
 
 async function reconcileConfigInteractive() {
-  const existing = parseConfigFile();
-  const existingServerMap = new Map(
-    existing.servers.map((s) => [path.normalize(s.absolutePath), s])
-  );
-  const existingStaticMap = new Map(
-    existing.statics.map((s) => [path.normalize(s.absolutePath), s])
-  );
-  const existingProxiesMap = new Map(
-    existing.proxies.map((s) => [path.normalize(s.absolutePath), s])
-  );
+  const existing=parseConfigFile();
+  const existingServerMap=new Map(existing.servers.map((s)=>[path.normalize(s.absolutePath),s]));
+  const existingStaticMap=new Map(existing.statics.map((s)=>[path.normalize(s.absolutePath),s]));
+  const existingProxiesMap=new Map(existing.proxies.map((s)=>[path.normalize(s.absolutePath),s]));
 
-  const finalProxies = [];
-  const finalServers = [];
-  const finalStatics = [];
-  const seenProxies = new Set();
-  const seenServers = new Set();
-  const seenStatics = new Set();
+  const finalProxies = [];const seenProxies = new Set();
+  const finalServers = [];const seenServers = new Set();
+  const finalStatics = [];const seenStatics = new Set();  
 
   const scannedServers = discoverFiles(SERVERS_PATTERN);
   for (const spec of scannedServers) {
     const abs = path.normalize(spec.absolutePath);
     let descriptor;
-    try {
-      descriptor = await loadServerDescriptor(abs);
-    } catch (error) {
+    try {descriptor = await loadServerDescriptor(abs);}
+    catch (error) {
       console.warn(`Skipping ${abs}: ${error.message}`);
       continue;
     }
@@ -771,16 +732,9 @@ async function reconcileConfigInteractive() {
   }
 
   for (const [abs, entry] of existingServerMap.entries()) {
-    if (seenServers.has(abs)) {
-      continue;
-    }
-    const keep = await askYesNo(
-      `Config references ${abs} but it was not found in scan. Keep it?`,
-      false
-    );
-    if (!keep) {
-      continue;
-    }
+    if(seenServers.has(abs)){continue;}
+    const keep = await askYesNo(`Config references ${abs} but it was not found in scan. Keep it?`,false);
+    if(!keep){continue;}
     try {
       const descriptor = await loadServerDescriptor(abs);
       const domains = (entry.domains && entry.domains.length) ? entry.domains : descriptor.domains;
@@ -788,14 +742,14 @@ async function reconcileConfigInteractive() {
         ...descriptor,
         filename: entry.displayName || path.basename(abs),
         absolutePath: abs,
-        domains,
+        domains
       });
     } catch (error) {
       console.warn(`Skipping ${abs}: ${error.message}`);
     }
   }
 
-  const scannedStatics = loadStaticDescriptors();
+  const scannedStatics = loadDescriptorsOfKind('static',STATIC_PATTERN);
   await reconcileDescriptors({
     label: 'static',
     type: 'static',
@@ -809,17 +763,15 @@ async function reconcileConfigInteractive() {
 
   const scannedProxies = loadDescriptorsOfKind('proxy',PROXY_PATTERN);
   await reconcileDescriptors({
-    label: 'proxy',
-    type: 'proxy',
-    discovered: scannedProxies,
-    existingMap: existingProxiesMap,
-    finalList: finalProxies,
-    seenSet: seenProxies,
-    parseDomainsFromDisk: (abs) =>
-      parseStaticAndProxiesDomains(abs, path.basename(abs), 'proxy'),
+    label:'proxy',type:'proxy',
+    discovered:scannedProxies,
+    existingMap:existingProxiesMap,
+    finalList:finalProxies,
+    seenSet:seenProxies,
+    parseDomainsFromDisk: (abs) =>parseStaticAndProxiesDomains(abs,path.basename(abs),'proxy')
   });
 
-  return { serverDescriptors: finalServers, staticDescriptors: finalStatics, proxiesDescriptors: finalProxies };
+  return {serverDescriptors:finalServers,staticDescriptors:finalStatics,proxiesDescriptors:finalProxies};
 }
 
 function buildDomainAppMap(serverDescriptors, staticAppDescriptors, proxyAppDescriptors = []) {
