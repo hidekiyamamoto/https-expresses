@@ -16,6 +16,7 @@ Module._initPaths();
 
 // Default configuration
 const DEFAULT_CONFIG = {
+  proxyPattern: '.*\\.proxy.hts$',
   serversPattern: '.*\\.hts.js$',
   staticPattern: '.*\\.hts.txt$',
   certRoot: '/etc/letsencrypt/live',
@@ -24,6 +25,7 @@ const DEFAULT_CONFIG = {
 
 const CONFIG_PATH = path.join(__dirname, 'https-expresses.cfg');
 
+let PROXY_PATTERN = new RegExp(DEFAULT_CONFIG.proxyPattern);
 let SERVERS_PATTERN = new RegExp(DEFAULT_CONFIG.serversPattern);
 let STATIC_PATTERN = new RegExp(DEFAULT_CONFIG.staticPattern);
 let CERT_ROOT = DEFAULT_CONFIG.certRoot;
@@ -97,6 +99,7 @@ function loadExternalModule(name) {
 const express = loadExternalModule('express');
 const serveStatic = loadExternalModule('serve-static');
 const compression = loadExternalModule('compression');
+const { createProxyMiddleware }=loadExternalModule('http-proxy-middleware');
 
 function buildTemplateContent() {
   return `'use strict';
@@ -208,6 +211,10 @@ function parseCliArgs(argv = process.argv.slice(2)) {
         options.staticPattern = argv[i + 1];
         i += 1;
         break;
+      case '--proxy-pattern':
+        options.proxyPattern = argv[i + 1];
+        i += 1;
+        break;
       case '--update':
         options.update = true;
         break;
@@ -237,6 +244,10 @@ function applyConfiguration(overrides = {}) {
 
   if (overrides.staticPattern) {
     STATIC_PATTERN = new RegExp(overrides.staticPattern);
+  }
+
+  if (overrides.proxyPattern) {
+    PROXY_PATTERN = new RegExp(overrides.proxyPattern);
   }
 
   if (overrides.certRoot) {
@@ -317,6 +328,12 @@ function discoverStaticFiles() {
     displayName: path.basename(absolutePath),
   }));
 }
+function discoverProxyFiles() {
+  return walkMatchingFiles({ root: '/', pattern: PROXY_PATTERN }).map((absolutePath) => ({
+    absolutePath,
+    displayName: path.basename(absolutePath),
+  }));
+}
 
 async function loadServerDescriptor(modulePath) {
   const rawExport = require(modulePath);
@@ -389,7 +406,7 @@ async function loadServerDescriptor(modulePath) {
   return { app, domains, meta };
 }
 
-function parseStaticDomains(filePath, filename) {
+function parseStaticAndProxiesDomains(filePath, filename, filetype) {
   const sanitizeDomain = (value) => {
     let domain = value.trim();
     domain = domain.replace(/^https?:\/\//i, '');
@@ -432,10 +449,10 @@ function parseStaticDomains(filePath, filename) {
     if (changed && updatedContent !== contents) {
       try {
         fs.writeFileSync(filePath, updatedContent, 'utf8');
-        console.log(`Normalized static definition ${filename}`);
+        console.log(`Normalized ${filetype} definition ${filename}`);
       } catch (writeError) {
         console.warn(
-          `Could not rewrite static definition ${filename} without protocol prefixes: ${writeError.message}`
+          `Could not rewrite ${filetype} definition ${filename} without protocol prefixes: ${writeError.message}`
         );
       }
     }
@@ -444,7 +461,7 @@ function parseStaticDomains(filePath, filename) {
       return domains;
     }
   } catch (error) {
-    console.warn(`Could not read static definition ${filename}: ${error.message}`);
+    console.warn(`Could not read ${filetype} definition ${filename}: ${error.message}`);
   }
 
   // Fallback: infer from filename by stripping known extensions
@@ -456,12 +473,90 @@ function loadStaticDescriptors() {
   const discovered = discoverStaticFiles();
 
   return discovered.map(({ absolutePath, displayName }) => {
-    const domains = parseStaticDomains(absolutePath, displayName);
+    const domains = parseStaticAndProxiesDomains(absolutePath, displayName, 'static');
     return {
       type: 'static',
       filename: displayName,
       absolutePath,
       domains,
+    };
+  });
+}
+
+function loadProxyDescriptors() {
+  const discovered = discoverProxyFiles();
+  return discovered.map(({ absolutePath, displayName }) => {
+    let domains = [];
+    let target;
+
+    try {
+      const contents = fs.readFileSync(absolutePath, 'utf8');
+      const lines = contents.split(/\r?\n/);
+
+      for (const rawLine of lines) {
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) {
+          continue;
+        }
+
+        const [rawDomain, rawTarget] = trimmed.split(/\s+/, 2);
+        if (!rawDomain || !rawTarget) {
+          continue;
+        }
+
+        const sanitizeDomain = (value) => {
+          let domain = value.trim();
+          domain = domain.replace(/^https?:\/\//i, '');
+          domain = domain.replace(/\/+$/, '');
+          return domain;
+        };
+
+        const sanitizedDomain = sanitizeDomain(rawDomain);
+        if (sanitizedDomain) {
+          domains.push(sanitizedDomain);
+        }
+
+        let normalizedTarget = rawTarget;
+        if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(normalizedTarget)) {
+          if (/^[^:]+:[0-9]+$/.test(normalizedTarget)) {
+            normalizedTarget = `http://${normalizedTarget}`;
+          } else if (/^[0-9]+$/.test(normalizedTarget)) {
+            normalizedTarget = `http://localhost:${normalizedTarget}`;
+          } else {
+            normalizedTarget = `http://${normalizedTarget}`;
+          }
+        }
+
+        target = normalizedTarget;
+        break;
+      }
+    } catch (error) {
+      console.warn(`Could not read proxy definition ${displayName}: ${error.message}`);
+    }
+
+    if (!domains.length || !target) {
+      const baseName = displayName.replace(/\.proxy\.hts$/i, '');
+      const parts = baseName.split('.');
+      let portPart;
+      if (parts.length > 1 && /^[0-9]+$/.test(parts[parts.length - 1])) {
+        portPart = parts.pop();
+      }
+      const fallbackDomain = parts.join('.');
+      if (!domains.length && fallbackDomain) {
+        domains = [fallbackDomain];
+      }
+      const port = portPart || '80';
+      if (!target) {
+        target = `http://localhost:${port}`;
+      }
+    }
+
+    return {
+      type: 'proxy',
+      filename: displayName,
+      absolutePath,
+      domains,
+      target
     };
   });
 }
@@ -515,15 +610,39 @@ function createStaticApp(rootDir) {
   return app;
 }
 
-function createStaticAppDescriptors(staticDescriptors) {
+function createStaticAppDescriptors(descriptors) {
   const results = [];
-  staticDescriptors.forEach(({ filename, absolutePath, domains }) => {
+  descriptors.forEach(({ filename, absolutePath, domains }) => {
     const rootDir = path.dirname(absolutePath);
     try {
       const app = createStaticApp(rootDir);
       results.push({ filename, domains, app });
     } catch (error) {
       console.warn(`Skipping static ${filename}: ${error.message}`);
+    }
+  });
+  return results;
+}
+
+function createProxyApp(target) {
+  const app = express();
+  app.use(
+    createProxyMiddleware({
+      target,
+      changeOrigin: false,
+    })
+  );
+  return app;
+}
+
+function createProxyAppDescriptors(descriptors) {
+  const results = [];
+  descriptors.forEach(({ filename, domains, target }) => {
+    try {
+      const app = createProxyApp(target);
+      results.push({ filename, domains, app });
+    } catch (error) {
+      console.warn(`Skipping proxy ${filename}: ${error.message}`);
     }
   });
   return results;
@@ -625,7 +744,7 @@ function hasCertificateForDomain(domain, certEntries) {
   return certEntries.some(({ domains }) => domains.some((pattern) => domainMatchesPattern(domain, pattern)));
 }
 
-function writeConfigFile(serverDescriptors, staticDescriptors, certEntries) {
+function writeConfigFile(serverDescriptors, staticDescriptors, proxiesDescriptors, certEntries) {
   const lines = [];
 
   serverDescriptors.forEach(({ filename, absolutePath, domains }) => {
@@ -658,13 +777,30 @@ function writeConfigFile(serverDescriptors, staticDescriptors, certEntries) {
     lines.push('');
   });
 
+  proxiesDescriptors.forEach(({ filename, absolutePath, domains,target }) => {
+    const id = absolutePath || path.join(__dirname, filename);
+    lines.push(id);
+    lines.push('  type: static');
+    lines.push(`  target: ${target}`);
+    lines.push('  domains:');
+    if (!domains.length) {
+      lines.push('    - (none) (cert: n/a)');
+    } else {
+      domains.forEach((domain) => {
+        const certStatus = hasCertificateForDomain(domain, certEntries) ? 'present' : 'missing';
+        lines.push(`    - ${domain} (cert: ${certStatus})`);
+      });
+    }
+    lines.push('');
+  });
+
   fs.writeFileSync(CONFIG_PATH, lines.join('\n'));
   console.log(`Wrote config summary to ${CONFIG_PATH}`);
 }
 
 function parseConfigFile() {
   if (!fs.existsSync(CONFIG_PATH)) {
-    return { servers: [], statics: [] };
+    return { servers: [], statics: [], proxies: [] };
   }
 
   const content = fs.readFileSync(CONFIG_PATH, 'utf8');
@@ -695,6 +831,10 @@ function parseConfigFile() {
     const trimmed = line.trim();
     if (trimmed.startsWith('type:')) {
       current.type = trimmed.split(':').slice(1).join(':').trim();
+      return;
+    }
+    if (trimmed.startsWith('target:')) {
+      current.target = trimmed.split(':').slice(1).join(':').trim();
       return;
     }
     if (trimmed.startsWith('dir:')) {
@@ -741,7 +881,22 @@ function parseConfigFile() {
       };
     });
 
-  return { servers, statics };
+  const proxies = entries
+    .filter((e) => e.type === 'proxy' && e.id)
+    .map((e) => {
+      const absolutePath = path.isAbsolute(e.id)
+        ? e.id
+        : e.dir
+        ? path.join(e.dir, e.id)
+        : path.join(__dirname, e.id);
+      return {
+        absolutePath,
+        displayName: path.basename(absolutePath),
+        domains: e.domains || [],
+      };
+    });
+
+  return { servers, statics, proxies };
 }
 
 async function reconcileConfigInteractive() {
@@ -752,9 +907,14 @@ async function reconcileConfigInteractive() {
   const existingStaticMap = new Map(
     existing.statics.map((s) => [path.normalize(s.absolutePath), s])
   );
+  const existingProxiesMap = new Map(
+    existing.proxies.map((s) => [path.normalize(s.absolutePath), s])
+  );
 
+  const finalProxies = [];
   const finalServers = [];
   const finalStatics = [];
+  const seenProxies = new Set();
   const seenServers = new Set();
   const seenStatics = new Set();
 
@@ -875,7 +1035,7 @@ async function reconcileConfigInteractive() {
     }
     let domains = entry.domains || [];
     if (fs.existsSync(abs)) {
-      domains = parseStaticDomains(abs, path.basename(abs));
+      domains = parseStaticAndProxiesDomains(abs, path.basename(abs),'static');
     }
     finalStatics.push({
       type: 'static',
@@ -885,37 +1045,92 @@ async function reconcileConfigInteractive() {
     });
   }
 
-  return { serverDescriptors: finalServers, staticDescriptors: finalStatics };
+
+  const scannedProxies = loadProxyDescriptors();
+  for (const { filename, absolutePath, domains } of scannedProxies) {
+    const abs = path.normalize(absolutePath);
+    seenProxies.add(abs);
+    const existingEntry = existingProxiesMap.get(abs);
+    let effectiveDomains = domains;
+
+    if (existingEntry) {
+      const stored = existingEntry.domains || [];
+      const additions = effectiveDomains.filter((d) => !stored.includes(d));
+      const removals = stored.filter((d) => !effectiveDomains.includes(d));
+      if (additions.length || removals.length) {
+        const answer = await askYesNo(
+          `Update domains for proxy ${abs}? existing: [${stored.join(', ')}], current: [${effectiveDomains.join(', ')}]`,
+          true
+        );
+        if (!answer) {
+          effectiveDomains = stored;
+        }
+      }
+    } else {
+      const answer = await askYesNo(
+        `Add new proxy definition ${abs} with domains [${effectiveDomains.join(', ')}]?`,
+        true
+      );
+      if (!answer) {
+        continue;
+      }
+    }
+
+    finalProxies.push({
+      type: 'proxy',
+      filename,
+      absolutePath: abs,
+      domains: effectiveDomains,
+    });
+  }
+
+  for (const [abs, entry] of existingProxiesMap.entries()) {
+    if (seenProxies.has(abs)) {
+      continue;
+    }
+    const keep = await askYesNo(
+      `Config references proxy ${abs} but it was not found in scan. Keep it?`,
+      false
+    );
+    if (!keep) {
+      continue;
+    }
+    let domains = entry.domains || [];
+    if (fs.existsSync(abs)) {
+      domains = parseStaticAndProxiesDomains(abs, path.basename(abs),'proxy');
+    }
+    finalProxies.push({
+      type: 'proxy',
+      filename: entry.displayName || path.basename(abs),
+      absolutePath: abs,
+      domains,
+    });
+  }
+
+  return { serverDescriptors: finalServers, staticDescriptors: finalStatics, proxiesDescriptors: finalProxies };
 }
 
-function buildDomainAppMap(serverDescriptors, staticAppDescriptors = []) {
+function buildDomainAppMap(serverDescriptors, staticAppDescriptors, proxyAppDescriptors = []) {
   const domainToApp = new Map();
 
-  serverDescriptors.forEach(({ domains, app, filename }) => {
-    domains.forEach((domain) => {
-      const normalized = String(domain).trim().toLowerCase();
-      if (!normalized) {
-        return;
-      }
-      if (domainToApp.has(normalized)) {
-        console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);
-      }
-      domainToApp.set(normalized, { app, source: filename });
+  const attachDescriptors = (descriptors) => {
+    descriptors.forEach(({ domains, app, filename }) => {
+      domains.forEach((domain) => {
+        const normalized = String(domain).trim().toLowerCase();
+        if (!normalized) {
+          return;
+        }
+        if (domainToApp.has(normalized)) {
+          console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);
+        }
+        domainToApp.set(normalized, { app, source: filename });
+      });
     });
-  });
+  };
 
-  staticAppDescriptors.forEach(({ domains, app, filename }) => {
-    domains.forEach((domain) => {
-      const normalized = String(domain).trim().toLowerCase();
-      if (!normalized) {
-        return;
-      }
-      if (domainToApp.has(normalized)) {
-        console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);
-      }
-      domainToApp.set(normalized, { app, source: filename });
-    });
-  });
+  attachDescriptors(serverDescriptors);
+  attachDescriptors(staticAppDescriptors);
+  attachDescriptors(proxyAppDescriptors);
 
   return domainToApp;
 }
@@ -996,14 +1211,16 @@ async function main(options = {}) {
 
   let serverDescriptors = [];
   let staticDescriptors = [];
+  let proxyDescriptors = [];
   let certificateEntries = [];
 
   if (shouldUpdate) {
     const reconciled = await reconcileConfigInteractive();
     serverDescriptors = reconciled.serverDescriptors;
     staticDescriptors = reconciled.staticDescriptors;
+    proxyDescriptors = reconciled.proxyDescriptors || [];
     certificateEntries = loadCertificateEntries();
-    writeConfigFile(serverDescriptors, staticDescriptors, certificateEntries);
+    writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors, certificateEntries);
     if (options.update) {
       console.log('Interactive update complete. Exiting (--update).');
       return;
@@ -1032,8 +1249,11 @@ async function main(options = {}) {
     certificateEntries = loadCertificateEntries();
   }
 
+  // Proxies are discovered from disk for runtime routing; config is summary-only.
+  proxyDescriptors = loadProxyDescriptors();
+  const proxyApps = createProxyAppDescriptors(proxyDescriptors);
   const staticApps = createStaticAppDescriptors(staticDescriptors);
-  const domainToApp = buildDomainAppMap(serverDescriptors, staticApps);
+  const domainToApp = buildDomainAppMap(serverDescriptors, staticApps, proxyApps);
   const certDomainSet = buildCertDomainSet(certificateEntries);
 
   const primaryCert = certificateEntries[0];
