@@ -1,11 +1,7 @@
 'use strict';
-
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
-const tls = require('tls');
-const Module = require('module');
-const readline = require('readline');
+const fs = require('fs');const path = require('path');
+const https = require('https');const tls = require('tls');
+const Module = require('module');const readline = require('readline');
 const { execSync } = require('child_process');
 const { X509Certificate } = require('crypto');
 
@@ -147,11 +143,6 @@ const serveStatic = loadExternalModule('serve-static');
 const compression = loadExternalModule('compression');
 const { createProxyMiddleware }=loadExternalModule('http-proxy-middleware');
 
-
-/*
-    // Health endpoint
-    app.get('/healthz',(req,res)=>{res.json({status:'ok',service:'template.hts.js',at:new Date().toISOString()});});
-*/
 function writeTemplateFile(destination) {
   const targetPath = path.isAbsolute(destination)
     ? destination
@@ -172,64 +163,27 @@ async function askYesNo(question, defaultYes = true) {
     rl.question(`${question} ${suffix} `, (answer) => {
       rl.close();
       const normalized = String(answer || '').trim().toLowerCase();
-      if (!normalized) {
-        resolve(defaultYes);
-        return;
-      }
+      if(!normalized){resolve(defaultYes);return;}
       resolve(normalized === 'y' || normalized === 'yes');
     });
   });
 }
-
 function parseCliArgs(argv = process.argv.slice(2)) {
   const options = {};
-
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
-    switch (arg) {
-      case '--help':
-      case '-h':
-        options.help = true;
-        break;
-      case '--https-port':
-        options.httpsPort = Number(argv[i + 1]);
-        i += 1;
-        break;
-      case '--cert-root':
-        options.certRoot = argv[i + 1];
-        i += 1;
-        break;
-      case '--pattern':
-        options.serversPattern = argv[i + 1];
-        i += 1;
-        break;
-      case '--static-pattern':
-        options.staticPattern = argv[i + 1];
-        i += 1;
-        break;
-      case '--proxy-pattern':
-        options.proxyPattern = argv[i + 1];
-        i += 1;
-        break;
-      case '--update':
-        options.update = true;
-        break;
-      case '--write-template': {
-        const nextVal = argv[i + 1];
-        if (nextVal && !nextVal.startsWith('-')) {
-          options.writeTemplate = nextVal;
-          i += 1;
-        } else {
-          options.writeTemplate = 'template.hts.js';
-        }
-        break;
-      }
-      default:
-        // ignore unknown flags for now
-        break;
+  const flags = {
+    '--help': () => (options.help = true),
+    '--https-port': i => (options.httpsPort = Number(argv[++i])),
+    '--cert-root': i => (options.certRoot = argv[++i]),
+    '--pattern': i => (options.serversPattern = argv[++i]),
+    '--static-pattern': i => (options.staticPattern = argv[++i]),
+    '--proxy-pattern': i => (options.proxyPattern = argv[++i]),
+    '--update': () => (options.update = true),
+    '--write-template': i => {
+      const v = argv[i + 1];
+      options.writeTemplate = v && !v.startsWith('-') ? argv[++i] : 'template.hts.js';
     }
-  }
-
+  };
+  for (let i = 0; i < argv.length; i++) flags[argv[i]]?.(i);
   return options;
 }
 
@@ -242,38 +196,22 @@ function applyConfiguration(overrides = {}) {
     HTTPS_PORT = overrides.httpsPort;
   }
 }
-
 function walkMatchingFiles({ root = '/', pattern }) {
-  const matches = new Set();
-  const skipDirs = new Set(['node_modules', '.git', '.hg', '.svn']);
+  const skip = new Set(['node_modules', '.git', '.hg', '.svn']);
   const stack = [path.normalize(root)];
-
-  while (stack.length) {
-    const current = stack.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch (error) {
-      // skip unreadable dirs
-      continue;
-    }
-
-    entries.forEach((entry) => {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (!skipDirs.has(entry.name)) {
-          stack.push(fullPath);
-        }
-        return;
-      }
-      if (entry.isFile() && pattern.test(entry.name)) {
-        matches.add(path.normalize(fullPath));
-      }
-    });
-  }
-
-  return Array.from(matches);
+  const matches = new Set();
+  while (stack.length){
+    let entries;const dir=stack.pop();
+    try{entries=fs.readdirSync(dir, { withFileTypes: true });}
+    catch{continue;}
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory() && !skip.has(e.name)) stack.push(p);
+      if (e.isFile() && pattern.test(e.name)) matches.add(path.normalize(p));
+  } }
+  return [...matches];
 }
+
 
 function discoverFiles(PATTERN) {
   return walkMatchingFiles({ root: '/', pattern: PATTERN }).map((absolutePath) => ({
@@ -509,17 +447,17 @@ function loadCertificateEntries() {
   if(!fs.existsSync(CERT_ROOT)){throw new Error(`Certificate directory ${CERT_ROOT} does not exist.`);}
   const directories = fs.readdirSync(CERT_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory());
   if (!directories.length) {throw new Error(`No certificates found under ${CERT_ROOT}.`);}
-  const entries = directories.map((entry) => {
-    const certDir = path.join(CERT_ROOT, entry.name);
-    const keyPath = path.join(certDir, 'privkey.pem');
-    const certPath = path.join(certDir, 'cert.pem');
-    const chainPath = path.join(certDir, 'chain.pem');
-    const key = readFileIfExists(keyPath);
-    const cert = readFileIfExists(certPath);
-    const ca = readFileIfExists(chainPath);
+  const entries=directories.map((entry) => {
+    const certDir=path.join(CERT_ROOT, entry.name);
+    const keyPath=path.join(certDir,'privkey.pem');
+    const certPath=path.join(certDir,'cert.pem');
+    const chainPath=path.join(certDir,'chain.pem');
+    const key=readFileIfExists(keyPath);
+    const cert=readFileIfExists(certPath);
+    const ca=readFileIfExists(chainPath);
     if (!key || !cert) {throw new Error(`Missing key or certificate in ${certDir}.`);}
-    const domains = parseCertificateDomains(cert, entry.name);
-    return { key, cert, ca, domains, source: certDir };
+    const domains=parseCertificateDomains(cert, entry.name);
+    return {key,cert,ca,domains,source:certDir};
   });
   return entries;
 }
@@ -541,23 +479,19 @@ function hasCertificateForDomain(domain, certEntries) {
 
 /* CEERTIFICATES - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
 /* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # CONFIG FILE - START */
-function writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors, certEntries) {
+function writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors, certEntries){
   const lines = [];
-
-  const pushEntry = (descriptor, type) => {
+  const pushEntry=(descriptor,type)=>{
     const { filename, absolutePath, domains, target } = descriptor;
     const id = absolutePath || path.join(__dirname, filename);
     lines.push(id);
     lines.push(`  type: ${type}`);
     lines.push(`  dir: ${path.dirname(id)}`);
-    if (type === 'proxy' && target) {
-      lines.push(`  target: ${target}`);
-    }
+    if(type === 'proxy' && target){lines.push(`  target: ${target}`);}
     lines.push('  domains:');
-    if (!domains.length) {
-      lines.push('    - (none) (cert: n/a)');
-    } else {
-      domains.forEach((domain) => {
+    if(!domains.length) {lines.push('    - (none) (cert: n/a)');} 
+    else{
+      domains.forEach((domain)=>{
         const certStatus = hasCertificateForDomain(domain, certEntries) ? 'present' : 'missing';
         lines.push(`    - ${domain} (cert: ${certStatus})`);
       });
@@ -574,10 +508,7 @@ function writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors,
 }
 
 function parseConfigFile() {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    return { servers: [], statics: [], proxies: [] };
-  }
-
+  if(!fs.existsSync(CONFIG_PATH)){return {servers:[],statics:[],proxies:[]};}
   const content = fs.readFileSync(CONFIG_PATH, 'utf8');
   const lines = content.split(/\r?\n/);
   const entries = [];
@@ -699,56 +630,48 @@ async function reconcileConfigInteractive() {
 
   const scannedServers = discoverFiles(SERVERS_PATTERN);
   for (const spec of scannedServers) {
-    const abs = path.normalize(spec.absolutePath);
+   const abs = path.normalize(spec.absolutePath);
     let descriptor;
-    try {descriptor = await loadServerDescriptor(abs);}
-    catch (error) {
-      console.warn(`Skipping ${abs}: ${error.message}`);
-      continue;
-    }
-
+    try{descriptor = await loadServerDescriptor(abs);}
+    catch(e){console.warn(`Skipping ${abs}: ${e.message}`);continue;}
     seenServers.add(abs);
-    const existingEntry = existingServerMap.get(abs);
+    const existing = existingServerMap.get(abs);
     let domains = descriptor.domains;
-
-    if (existingEntry) {
-      const stored = existingEntry.domains || [];
-      const additions = domains.filter((d) => !stored.includes(d));
-      const removals = stored.filter((d) => !domains.includes(d));
+    if (existing) {
+      const stored = existing.domains || [];
+      const additions = domains.filter(d => !stored.includes(d));
+      const removals = stored.filter(d => !domains.includes(d));
       if (additions.length || removals.length) {
-        const answer = await askYesNo(
-          `Update domains for ${abs}? existing: [${stored.join(', ')}], current: [${domains.join(', ')}]`,
-          true
-        );
-        if(!answer){domains=stored;}
+        const ok = await askYesNo(`Update domains for ${abs}? existing: [${stored.join(', ')}], current: [${domains.join(', ')}]`,true);
+        if (!ok) domains = stored;
       }
     } else {
-      const answer = await askYesNo(
-        `Add new Express module ${abs} with domains [${domains.join(', ')}]?`,
-        true
-      );
-      if(!answer){continue;}
+      const ok = await askYesNo(`Add new Express module ${abs} with domains [${domains.join(', ')}]?`,true);
+      if (!ok) continue;
     }
 
-    finalServers.push({ ...descriptor, filename: spec.displayName, absolutePath: abs, domains });
+    finalServers.push({...descriptor,
+      filename:spec.displayName,
+      absolutePath:abs,domains});
   }
 
-  for (const [abs, entry] of existingServerMap.entries()) {
-    if(seenServers.has(abs)){continue;}
-    const keep = await askYesNo(`Config references ${abs} but it was not found in scan. Keep it?`,false);
-    if(!keep){continue;}
+  for (const [abs, entry] of existingServerMap) {
+    if (seenServers.has(abs)) continue;
+    const keep=await askYesNo(`Config references ${abs} but it was not found in scan. Keep it?`,false);
+    if (!keep) continue;
     try {
       const descriptor = await loadServerDescriptor(abs);
-      const domains = (entry.domains && entry.domains.length) ? entry.domains : descriptor.domains;
       finalServers.push({
         ...descriptor,
         filename: entry.displayName || path.basename(abs),
-        absolutePath:abs,domains
+        absolutePath: abs,
+        domains: entry.domains?.length ? entry.domains : descriptor.domains
       });
-    } catch (error) {
-      console.warn(`Skipping ${abs}: ${error.message}`);
+    } catch (e) {
+      console.warn(`Skipping ${abs}: ${e.message}`);
     }
   }
+
 
   const scannedStatics = loadDescriptorsOfKind('static',STATIC_PATTERN);
   await reconcileDescriptors({
@@ -767,28 +690,17 @@ async function reconcileConfigInteractive() {
   return {serverDescriptors:finalServers,staticDescriptors:finalStatics,proxiesDescriptors:finalProxies};
 }
 
-function buildDomainAppMap(serverDescriptors, staticAppDescriptors, proxyAppDescriptors = []) {
-  const domainToApp = new Map();
-
-  const attachDescriptors = (descriptors) => {
-    descriptors.forEach(({ domains, app, filename }) => {
-      domains.forEach((domain) => {
-        const normalized = String(domain).trim().toLowerCase();
-        if (!normalized) {
-          return;
-        }
-        if (domainToApp.has(normalized)) {
-          console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);
-        }
+function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescriptors = []){
+  const domainToApp=new Map();
+  const attachDescriptors=(descriptors)=>{
+    descriptors.forEach(({domains,app,filename})=>{
+      domains.forEach((domain)=>{const normalized=String(domain).trim().toLowerCase();if(!normalized){return;}
+        if(domainToApp.has(normalized)){console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);}
         domainToApp.set(normalized, { app, source: filename });
-      });
-    });
-  };
-
+  });});};
   attachDescriptors(serverDescriptors);
   attachDescriptors(staticAppDescriptors);
   attachDescriptors(proxyAppDescriptors);
-
   return domainToApp;
 }
 
@@ -813,13 +725,11 @@ function attachCertificateContexts(server, certEntries) {
 }
 
 function buildCertDomainSet(certEntries) {
-  const set = new Set();
+  const set=new Set();
   certEntries.forEach(({ domains }) => {
     (domains || []).forEach((d) => {
       const normalized = String(d || '').trim().toLowerCase();
-      if (normalized) {
-        set.add(normalized);
-      }
+      if(normalized){set.add(normalized);}
     });
   });
   return set;
@@ -896,9 +806,7 @@ async function main(options = {}) {
         const domains =
           spec.domains && spec.domains.length ? spec.domains : descriptor.domains;
         serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
-      } catch (error) {
-        console.warn(`Skipping ${spec.displayName}: ${error.message}`);
-      }
+      } catch (error) {console.warn(`Skipping ${spec.displayName}: ${error.message}`);}
     }
     certificateEntries = loadCertificateEntries();
   }
@@ -911,49 +819,26 @@ async function main(options = {}) {
   const certDomainSet = buildCertDomainSet(certificateEntries);
 
   const primaryCert = certificateEntries[0];
-  const httpsServer = https.createServer(
-    {
-      key: primaryCert.key,
-      cert: primaryCert.cert,
-      ca: primaryCert.ca,
-    },
-    createRequestHandler(domainToApp, certDomainSet)
+  const httpsServer = https.createServer({key:primaryCert.key,cert:primaryCert.cert,ca:primaryCert.ca},
+    createRequestHandler(domainToApp,certDomainSet)
   );
 
   attachCertificateContexts(httpsServer, certificateEntries);
-
-  httpsServer.on('listening',()=>{
-    console.log(`HTTPS server listening on port ${HTTPS_PORT}.`);
-  });
-
-  httpsServer.on('error', (error) => {
-    console.error('HTTPS server encountered an error:', error);
-  });
-
+  httpsServer.on('listening',()=>{console.log(`HTTPS server listening on port ${HTTPS_PORT}.`);});
+  httpsServer.on('error',(error)=>{console.error('HTTPS server encountered an error:',error);});
   httpsServer.listen(HTTPS_PORT);
 }
 
 if (require.main === module) {
-  const cliOptions = parseCliArgs(process.argv.slice(2));
-  if (cliOptions.help) {
-    console.log(httpExpresses.HELP_TEXT);
-    process.exit(0);
+  const cliOptions=parseCliArgs(process.argv.slice(2));
+  if(cliOptions.help){console.log(httpExpresses.HELP_TEXT);process.exit(0);}
+  if(cliOptions.writeTemplate){
+    try {writeTemplateFile(cliOptions.writeTemplate);process.exit(0);}
+    catch(error){process.exit(1);}
   }
-
-  if (cliOptions.writeTemplate) {
-    try {
-      writeTemplateFile(cliOptions.writeTemplate);
-      process.exit(0);
-    } catch (error) {
-      process.exit(1);
-    }
-  }
-
   main(cliOptions).catch((error) => {
     console.error(error.message || error);
-    if (error && error.stack) {
-      console.error(error.stack);
-    }
+    if (error && error.stack) {console.error(error.stack);}
     process.exitCode = 1;
   });
 }
