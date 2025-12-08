@@ -644,7 +644,11 @@ async function reconcileDescriptors({
     seenSet.add(abs);
     const existingEntry = existingMap.get(abs);
     let effectiveDomains = domains;
-
+    let target=false;
+    if(type=='proxy'){
+      target=absolutePath.split('.');
+      target=target[target.length-3].trim();
+    }
     if (existingEntry) {
       const stored = existingEntry.domains || [];
       const additions = effectiveDomains.filter((d) => !stored.includes(d));
@@ -663,8 +667,8 @@ async function reconcileDescriptors({
       );
       if(!answer){continue;}
     }
-
-    finalList.push({type,filename,absolutePath:abs,domains:effectiveDomains,target});
+    let obj={type,filename,absolutePath:abs,domains:effectiveDomains};
+    if(target){obj.target=target;}finalList.push(obj);
   }
 
   for (const [abs, entry] of existingMap.entries()) {
