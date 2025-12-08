@@ -444,8 +444,8 @@ function domainMatchesPattern(domain, pattern) {
   return d === p;
 }
 
-function hasCertificateForDomain(domain, certEntries) {
-  return certEntries.some(({ domains })=>domains.some((pattern)=>domainMatchesPattern(domain, pattern)));
+function hasCertificateForDomain(domain,certEntries){
+  return certEntries.some(({domains})=>domains.some((pattern)=>domainMatchesPattern(domain, pattern)));
 }
 
 /* CEERTIFICATES - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
@@ -533,8 +533,7 @@ function parseConfigFile() {
 }
 
 async function reconcileDescriptors({
-  label,
-  type,
+  label,type,
   discovered,
   existingMap,
   finalList,
@@ -592,99 +591,37 @@ async function reconcileDescriptors({
 }
 
 async function reconcileConfigInteractive() {
-  const existing=parseConfigFile();
-  const existingServerMap=new Map(existing.servers.map((s)=>[path.normalize(s.absolutePath),s]));
-  const existingStaticMap=new Map(existing.statics.map((s)=>[path.normalize(s.absolutePath),s]));
-  const existingProxiesMap=new Map(existing.proxies.map((s)=>[path.normalize(s.absolutePath),s]));
-
-  const finalProxies=[];const seenProxies=new Set();
-  const finalServers=[];const seenServers=new Set();
-  const finalStatics=[];const seenStatics=new Set();  
-
-  /*
-  const scannedServers=discoverFiles(SERVERS_PATTERN);
-  for (const spec of scannedServers) {
-   const abs=path.normalize(spec.absolutePath);
-    let descriptor;
-    try{descriptor=await loadServerDescriptor(abs);}
-    catch(e){console.warn(`Skipping ${abs}: ${e.message}`);continue;}
-    seenServers.add(abs);
-    const existing=existingServerMap.get(abs);
-    let domains=descriptor.domains;
-    if (existing) {
-      const stored=existing.domains || [];
-      const additions=domains.filter(d=>!stored.includes(d));
-      const removals=stored.filter(d=>!domains.includes(d));
-      if (additions.length || removals.length) {
-        const ok=await askYesNo(`Update domains for ${abs}? existing: [${stored.join(', ')}], current: [${domains.join(', ')}]`,true);
-        if (!ok) domains=stored;
-      }
-    } else {
-      const ok=await askYesNo(`Add new Express module ${abs} with domains [${domains.join(', ')}]?`,true);
-      if (!ok) continue;
-    }
-
-    finalServers.push({...descriptor,
-      filename:spec.displayName,
-      absolutePath:abs,domains});
+  const cfg = parseConfigFile();
+  const kinds = [
+    { label: 'express', pattern: SERVERS_PATTERN, list: cfg.servers },
+    { label: 'static',  pattern: STATIC_PATTERN,  list: cfg.statics },
+    { label: 'proxy',   pattern: PROXY_PATTERN,   list: cfg.proxies }
+  ];
+  const results={};
+  for (const { label, pattern, list } of kinds) {
+    const existingMap = new Map(list.map(s => [path.normalize(s.absolutePath), s]));
+    const finalList=[];const seenSet=new Set();
+    const discovered = await loadDescriptorsOfKind(label, pattern);
+    await reconcileDescriptors({
+      label,type:label,existingMap,discovered,finalList,seenSet,
+      parseDomainsFromDisk: abs =>
+        parseDomainsOfKind(abs, path.basename(abs), label)
+    });
+    results[label] = finalList;
   }
-
-  for (const [abs, entry] of existingServerMap) {
-    if (seenServers.has(abs)) continue;
-    const keep=await askYesNo(`Config references ${abs} but it was not found in scan. Keep it?`,false);
-    if (!keep) continue;
-    try {
-      const descriptor=await loadServerDescriptor(abs);
-      finalServers.push({
-        ...descriptor,
-        filename: entry.displayName || path.basename(abs),
-        absolutePath: abs,
-        domains: entry.domains?.length ? entry.domains : descriptor.domains
-      });
-    } catch (e) {
-      console.warn(`Skipping ${abs}: ${e.message}`);
-    }
-  }
-  */
-
-  const scannedServers=await loadDescriptorsOfKind('express',SERVERS_PATTERN);
-  await reconcileDescriptors({
-    label:'express',type:'express',existingMap:existingServerMap,
-    discovered:scannedServers,finalList:finalServers,seenSet:seenServers,
-    parseDomainsFromDisk:async function(abs){return await parseDomainsOfKind(abs, path.basename(abs), 'express')},
-  });
-  
-  const scannedStatics=await loadDescriptorsOfKind('static',STATIC_PATTERN);
-  await reconcileDescriptors({
-    label:'static',type:'static',existingMap:existingStaticMap,
-    discovered:scannedStatics,finalList:finalStatics,seenSet:seenStatics,
-    parseDomainsFromDisk:async function(abs){return await parseDomainsOfKind(abs, path.basename(abs), 'static')},
-  });
-
-  const scannedProxies=await loadDescriptorsOfKind('proxy',PROXY_PATTERN);
-  await reconcileDescriptors({
-    label:'proxy',type:'proxy',existingMap:existingProxiesMap,
-    discovered:scannedProxies,finalList:finalProxies,seenSet:seenProxies,
-    parseDomainsFromDisk:async function(abs){return await parseDomainsOfKind(abs,path.basename(abs),'proxy')}
-  });
-
-  return {serverDescriptors:finalServers,staticDescriptors:finalStatics,proxiesDescriptors:finalProxies};
+  return {serverDescriptors:results.express,staticDescriptors:results.static,proxiesDescriptors:results.proxy};
 }
+
 
 function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescriptors=[]){
   const domainToApp=new Map();
   const attachDescriptors=(descriptors)=>{
     descriptors.forEach(({domains,app,filename})=>{
-      try{
         domains.forEach((domain)=>{const normalized=String(domain).trim().toLowerCase();if(!normalized){return;}
           if(domainToApp.has(normalized)){console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);}
           domainToApp.set(normalized, { app, source: filename });
         });
-      }catch(ex){console.log(filename);
-        console.log(serverDescriptors);
-        console.log(staticAppDescriptors);
-        console.log(proxyAppDescriptors);throw ex;}
-});};
+  });};
   attachDescriptors(serverDescriptors);
   attachDescriptors(staticAppDescriptors);
   attachDescriptors(proxyAppDescriptors);
@@ -705,15 +642,11 @@ function attachCertificateContexts(server, certEntries){
   });
 }
 
-function buildCertDomainSet(certEntries) {
+function buildCertDomainSet(ee){
   const set=new Set();
-  certEntries.forEach(({ domains })=>{
-    (domains || []).forEach((d)=>{
-      const normalized=String(d || '').trim().toLowerCase();
-      if(normalized){set.add(normalized);}
-    });
-  });
-  return set;
+  ee.forEach(({domains})=>{(domains||[]).forEach((d)=>{const n=String(d || '').trim().toLowerCase();
+    if(n){set.add(n);}});
+  });return set;
 }
 
 function createRequestHandler(domainToApp, certDomainSet=new Set()) {
@@ -732,19 +665,19 @@ function createRequestHandler(domainToApp, certDomainSet=new Set()) {
       if(!res.headersSent){res.statusCode=500;res.setHeader('Content-Type', 'text/plain; charset=utf-8');}
       res.end('Internal server error.');
 } };}
-
 async function main(options={}) {
   console.log(httpExpresses.HELP_TEXT);
   applyConfiguration(options);
   if(options.help){return;}
+  if(options.update){return;}
 
-  const shouldUpdate=options.update || !fs.existsSync(CONFIG_PATH);
+  //const shouldUpdate=options.update || !fs.existsSync(CONFIG_PATH);
 
   let serverDescriptors=[];
   let staticDescriptors=[];
   let proxyDescriptors=[];
   let certificateEntries=[];
-
+  /*
   if (shouldUpdate) {
     const reconciled=await reconcileConfigInteractive();
     serverDescriptors=reconciled.serverDescriptors;
@@ -757,18 +690,24 @@ async function main(options={}) {
       return;
     }
   } else {
+  */
     const parsed=parseConfigFile();
-    const { servers, statics, proxies }=parsed;
-    staticDescriptors=statics.map((entry)=>({
-      type:'static',filename: entry.displayName,
-      absolutePath:entry.absolutePath,domains:entry.domains||[],
+    const {servers,statics,proxies}=parsed;
+    proxyDescriptors=proxies.map((item)=>({
+      type:'proxy',filename:item.displayName,
+      absolutePath:item.absolutePath,domains:item.domains||[],
+      target:item.target || Math.floor(Math.random()*5000)+5000
     }));
-    proxyDescriptors=proxies.map((entry)=>({
-      type:'proxy',filename: entry.displayName,
-      absolutePath: entry.absolutePath,domains:entry.domains||[],
-      target:entry.target || Math.floor(Math.random()*5000)+5000
+    staticDescriptors=statics.map((item)=>({
+      type:'static',filename:item.displayName,
+      absolutePath:item.absolutePath,domains:item.domains||[],
     }));
-
+    /*
+    serverDescriptors=servers.map((item)=>({
+      type:'express',filename:item.displayName,
+      absolutePath:item.absolutePath,domains:item.domains||[],
+    }));
+    */
     serverDescriptors=[];
     for (const spec of servers) {
       try {
@@ -778,11 +717,10 @@ async function main(options={}) {
         serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
       } catch (error) {console.warn(`Skipping ${spec.displayName}: ${error.message}`);}
     }
+    
     certificateEntries=loadCertificateEntries();
-  }
+  //}
 
-  // Proxies are discovered from disk for runtime routing; config is summary-only.
-  //proxyDescriptors=await loadDescriptorsOfKind('proxy',PROXY_PATTERN);
   const proxyApps=createProxyAppDescriptors(proxyDescriptors);
   const staticApps=createStaticAppDescriptors(staticDescriptors);
   const domainToApp=buildDomainAppMap(serverDescriptors, staticApps, proxyApps);
@@ -790,13 +728,20 @@ async function main(options={}) {
 
   const primaryCert=certificateEntries[0];
   const httpsServer=https.createServer({key:primaryCert.key,cert:primaryCert.cert,ca:primaryCert.ca},
-    createRequestHandler(domainToApp,certDomainSet)
-  );
+    createRequestHandler(domainToApp,certDomainSet));
 
   attachCertificateContexts(httpsServer, certificateEntries);
   httpsServer.on('listening',()=>{console.log(`HTTPS server listening on port ${HTTPS_PORT}.`);});
   httpsServer.on('error',(error)=>{console.error('HTTPS server encountered an error:',error);});
   httpsServer.listen(HTTPS_PORT);
+}
+
+async function updateConfig(options){
+  const ok=await reconcileConfigInteractive();
+  const certificateEntries=loadCertificateEntries();
+  writeConfigFile(ok.serverDescriptors,ok.staticDescriptors,ok.proxiesDescriptors, certificateEntries);
+  console.log('Interactive update complete. Exiting (--update).');
+  process.exit(0);
 }
 
 if (require.main === module) {
@@ -806,11 +751,14 @@ if (require.main === module) {
     try {writeTemplateFile(cliOptions.writeTemplate);process.exit(0);}
     catch(error){process.exit(1);}
   }
-  main(cliOptions).catch((error)=>{
-    console.error(error.message || error);
-    if (error && error.stack) {console.error(error.stack);}
-    process.exitCode=1;
-  });
+  if(cliOptions.update){updateConfig(cliOptions);}
+  else{
+    main(cliOptions).catch((error)=>{
+      console.error(error.message || error);
+      if (error && error.stack) {console.error(error.stack);}
+      process.exitCode=1;
+    });
+  }
 }
 
 module.exports={ main };
