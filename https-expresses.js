@@ -482,31 +482,21 @@ function parseConfigFile() {
   if(!fs.existsSync(CONFIG_PATH)){return {servers:[],statics:[],proxies:[]};}
   const content=fs.readFileSync(CONFIG_PATH, 'utf8');
   const lines=content.split(/\r?\n/);
-  const entries=[];
-  let current=null;
-
-  const flush=()=>{
-    if (current && current.type && current.id) {
-      current.domains=current.domains || [];
-      entries.push(current);
-    }
-    current=null;
-  };
-
+  const entries=[];let curr=null;
+  const flush=()=>{if(curr&&curr.type&&curr.id){curr.domains=curr.domains||[];entries.push(curr);}curr=null;};
   lines.forEach((line)=>{
     if(!line.trim()){flush();return;}
-    if (!line.startsWith(' ')) {flush();current={ id: line.trim(), domains: [] };return;}
+    if (!line.startsWith(' ')) {flush();curr={id:line.trim(),domains:[]};return;}
     const trimmed=line.trim();
-    if (trimmed.startsWith('type:')){current.type=trimmed.split(':').slice(1).join(':').trim();return;}
-    if (trimmed.startsWith('target:')){current.target=trimmed.split(':').slice(1).join(':').trim();return;}
-    if (trimmed.startsWith('dir:')){current.dir=trimmed.split(':').slice(1).join(':').trim();return;}
+    if (trimmed.startsWith('type:')){curr.type=trimmed.split(':').slice(1).join(':').trim();return;}
+    if (trimmed.startsWith('target:')){curr.target=trimmed.split(':').slice(1).join(':').trim();return;}
+    if (trimmed.startsWith('dir:')){curr.dir=trimmed.split(':').slice(1).join(':').trim();return;}
     if (trimmed.startsWith('-')){
       const domainPart=trimmed.slice(1).trim();
       const withoutCert=domainPart.replace(/\(cert:.*\)$/i, '').trim();
       if (withoutCert && withoutCert !== '(none)') {
-        current.domains.push(withoutCert);
-      }
-    }
+        curr.domains.push(withoutCert);
+    } }
   });
   flush();
 
@@ -515,15 +505,13 @@ function parseConfigFile() {
       .filter((e)=>e.type === type && e.id)
       .map((e)=>{
         const absolutePath=path.isAbsolute(e.id)
-          ? e.id
-          : e.dir
+          ? e.id : e.dir
           ? path.join(e.dir, e.id)
           : path.join(__dirname, e.id);
         return {
-          absolutePath,
-          displayName: path.basename(absolutePath),
-          domains: e.domains || [],
-          target: e.target
+          absolutePath,displayName:path.basename(absolutePath),
+          domains:e.domains || [],
+          target:e.target
         };
       });
   const servers=mapEntries('express');
@@ -533,13 +521,8 @@ function parseConfigFile() {
 }
 
 async function reconcileDescriptors({
-  label,type,
-  discovered,
-  existingMap,
-  finalList,
-  seenSet,
-  parseDomainsFromDisk,
-}) {
+  label,type,discovered,existingMap,
+  finalList,seenSet,parseDomainsFromDisk}){
   for (const { filename, absolutePath, domains } of discovered) {
     var abs=false;
     try{abs=path.normalize(absolutePath);}
@@ -612,7 +595,6 @@ async function reconcileConfigInteractive() {
   return {serverDescriptors:results.express,staticDescriptors:results.static,proxiesDescriptors:results.proxy};
 }
 
-
 function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescriptors=[]){
   const domainToApp=new Map();
   const attachDescriptors=(descriptors)=>{
@@ -668,68 +650,35 @@ function createRequestHandler(domainToApp, certDomainSet=new Set()) {
 async function main(options={}) {
   console.log(httpExpresses.HELP_TEXT);
   applyConfiguration(options);
-  if(options.help){return;}
-  if(options.update){return;}
-
-  //const shouldUpdate=options.update || !fs.existsSync(CONFIG_PATH);
-
-  let serverDescriptors=[];
-  let staticDescriptors=[];
+  if(options.help||options.update){return;}
+  let serverDescriptors=[];let staticDescriptors=[];
   let proxyDescriptors=[];
-  let certificateEntries=[];
-  /*
-  if (shouldUpdate) {
-    const reconciled=await reconcileConfigInteractive();
-    serverDescriptors=reconciled.serverDescriptors;
-    staticDescriptors=reconciled.staticDescriptors;
-    proxyDescriptors=reconciled.proxiesDescriptors || [];
-    certificateEntries=loadCertificateEntries();
-    writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors, certificateEntries);
-    if (options.update) {
-      console.log('Interactive update complete. Exiting (--update).');
-      return;
-    }
-  } else {
-  */
-    const parsed=parseConfigFile();
-    const {servers,statics,proxies}=parsed;
-    proxyDescriptors=proxies.map((item)=>({
-      type:'proxy',filename:item.displayName,
-      absolutePath:item.absolutePath,domains:item.domains||[],
-      target:item.target || Math.floor(Math.random()*5000)+5000
-    }));
-    staticDescriptors=statics.map((item)=>({
-      type:'static',filename:item.displayName,
-      absolutePath:item.absolutePath,domains:item.domains||[],
-    }));
-    /*
-    serverDescriptors=servers.map((item)=>({
-      type:'express',filename:item.displayName,
-      absolutePath:item.absolutePath,domains:item.domains||[],
-    }));
-    */
-    serverDescriptors=[];
-    for (const spec of servers) {
-      try {
-        const descriptor=await loadServerDescriptor(spec.absolutePath);
-        const domains =
-          spec.domains && spec.domains.length ? spec.domains : descriptor.domains;
-        serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
-      } catch (error) {console.warn(`Skipping ${spec.displayName}: ${error.message}`);}
-    }
-    
-    certificateEntries=loadCertificateEntries();
-  //}
-
+  const parsed=parseConfigFile();
+  const {servers,statics,proxies}=parsed;
+  proxyDescriptors=proxies.map((item)=>({
+    type:'proxy',filename:item.displayName,
+    absolutePath:item.absolutePath,domains:item.domains||[],
+    target:item.target || Math.floor(Math.random()*5000)+5000
+  }));
+  staticDescriptors=statics.map((item)=>({
+    type:'static',filename:item.displayName,
+    absolutePath:item.absolutePath,domains:item.domains||[],
+  }));
+  for (const spec of servers) {
+    try {
+      const descriptor=await loadServerDescriptor(spec.absolutePath);
+      const domains=spec.domains && spec.domains.length ? spec.domains : descriptor.domains;
+      serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
+    } catch (error) {console.warn(`Skipping ${spec.displayName}: ${error.message}`);}
+  }
+  let certificateEntries=loadCertificateEntries();
   const proxyApps=createProxyAppDescriptors(proxyDescriptors);
   const staticApps=createStaticAppDescriptors(staticDescriptors);
   const domainToApp=buildDomainAppMap(serverDescriptors, staticApps, proxyApps);
   const certDomainSet=buildCertDomainSet(certificateEntries);
-
   const primaryCert=certificateEntries[0];
   const httpsServer=https.createServer({key:primaryCert.key,cert:primaryCert.cert,ca:primaryCert.ca},
     createRequestHandler(domainToApp,certDomainSet));
-
   attachCertificateContexts(httpsServer, certificateEntries);
   httpsServer.on('listening',()=>{console.log(`HTTPS server listening on port ${HTTPS_PORT}.`);});
   httpsServer.on('error',(error)=>{console.error('HTTPS server encountered an error:',error);});
