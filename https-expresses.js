@@ -117,6 +117,18 @@ module.exports={
 };`,
 HELP_TEXT:`
 ################################################################
+Description:
+  https-expresses is a simple and small nodejs program to stop dealing with https certificates, especially
+  multiple https certificates for different domains, from the same server. It's also made to avoid installing
+  apache or nginx, while maintaining everything certbot relatated automatic and easy.
+  
+  cool features:
+  - Features 3 types of ways for serving content behind https for multiple domains:
+    -- express apps, static folders, reverse proxies.
+  - Automatic installing of prerequisites on first load.
+  - Automatically scans the file system and automatically creates the config (*read info).
+  - Interactive config update after the first load.
+
 Usage:
   node ${path.basename(__filename)} [options]
 Options:
