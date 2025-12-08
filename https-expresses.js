@@ -677,10 +677,8 @@ async function reconcileDescriptors({
     let domains = entry.domains || [];
     if(fs.existsSync(abs)){domains=parseDomainsFromDisk(abs);}
     finalList.push({
-      type,
-      filename: entry.displayName || path.basename(abs),
-      absolutePath: abs,
-      domains,target
+      type,filename: entry.displayName || path.basename(abs),
+      absolutePath:abs,domains,target
     });
   }
 }
@@ -741,8 +739,7 @@ async function reconcileConfigInteractive() {
       finalServers.push({
         ...descriptor,
         filename: entry.displayName || path.basename(abs),
-        absolutePath: abs,
-        domains
+        absolutePath:abs,domains
       });
     } catch (error) {
       console.warn(`Skipping ${abs}: ${error.message}`);
@@ -751,24 +748,16 @@ async function reconcileConfigInteractive() {
 
   const scannedStatics = loadDescriptorsOfKind('static',STATIC_PATTERN);
   await reconcileDescriptors({
-    label: 'static',
-    type: 'static',
-    discovered: scannedStatics,
-    existingMap: existingStaticMap,
-    finalList: finalStatics,
-    seenSet: seenStatics,
-    parseDomainsFromDisk: (abs) =>
-      parseStaticAndProxiesDomains(abs, path.basename(abs), 'static'),
+    label:'static',type:'static',existingMap:existingStaticMap,
+    discovered:scannedStatics,finalList:finalStatics,seenSet:seenStatics,
+    parseDomainsFromDisk:(abs)=>parseStaticAndProxiesDomains(abs, path.basename(abs), 'static'),
   });
 
   const scannedProxies = loadDescriptorsOfKind('proxy',PROXY_PATTERN);
   await reconcileDescriptors({
-    label:'proxy',type:'proxy',
-    discovered:scannedProxies,
-    existingMap:existingProxiesMap,
-    finalList:finalProxies,
-    seenSet:seenProxies,
-    parseDomainsFromDisk: (abs) =>parseStaticAndProxiesDomains(abs,path.basename(abs),'proxy')
+    label:'proxy',type:'proxy',existingMap:existingProxiesMap,
+    discovered:scannedProxies,finalList:finalProxies,seenSet:seenProxies,
+    parseDomainsFromDisk:(abs)=>parseStaticAndProxiesDomains(abs,path.basename(abs),'proxy')
   });
 
   return {serverDescriptors:finalServers,staticDescriptors:finalStatics,proxiesDescriptors:finalProxies};
