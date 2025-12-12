@@ -13,8 +13,8 @@ Module._initPaths();
 // Default configuration
 const DEFAULT_CONFIG={
   proxyPattern: '.*\\.proxy.hts$',
+  staticPattern: '.*\\.static.hts$',
   serversPattern: '.*\\.hts.js$',
-  staticPattern: '.*\\.hts.txt$',
   certRoot: '/etc/letsencrypt/live',
   httpsPort: 443,
 };
@@ -22,8 +22,8 @@ const DEFAULT_CONFIG={
 const CONFIG_PATH=path.join(__dirname, 'https-expresses.cfg');
 
 let PROXY_PATTERN=new RegExp(DEFAULT_CONFIG.proxyPattern);
-let SERVERS_PATTERN=new RegExp(DEFAULT_CONFIG.serversPattern);
 let STATIC_PATTERN=new RegExp(DEFAULT_CONFIG.staticPattern);
+let SERVERS_PATTERN=new RegExp(DEFAULT_CONFIG.serversPattern);
 let CERT_ROOT=DEFAULT_CONFIG.certRoot;
 let HTTPS_PORT=DEFAULT_CONFIG.httpsPort; // Number(process.env.HTTPS_PORT || 443);
 /* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
@@ -77,6 +77,11 @@ const DOMAINS=['example.com', 'www.example.com'];
 // Optional metadata shown in https-expresses summaries.
 const MODULE_META={
   description: 'Starter Express app for https-expresses.',
+  // Optional async initialization hook called by https-expresses
+  // before the HTTPS server starts listening.
+  // initModule: async ({ app, domains, meta }) => {
+  //   // Place module-level startup logic here (e.g. DB connections).
+  // },
 };
 const fs=require('fs');
 const path=require('path');
@@ -216,14 +221,11 @@ function discoverFiles(PATTERN) {
 async function loadServerDescriptor(modulePath) {
   const rawExport=require(modulePath);
   let initializer;let initializerContext;
-  if (typeof rawExport === 'function') {
-    initializer=rawExport;
+  if (typeof rawExport === 'function') {initializer=rawExport;
   } else if (rawExport && typeof rawExport === 'object' && typeof rawExport.init === 'function') {
-    initializer=rawExport.init;
-    initializerContext=rawExport;
+    initializer=rawExport.init;initializerContext=rawExport;
   } else if (rawExport && typeof rawExport === 'object' && typeof rawExport.initialize === 'function') {
-    initializer=rawExport.initialize;
-    initializerContext=rawExport;
+    initializer=rawExport.initialize;initializerContext=rawExport;
   } else {
     throw new Error(
       `Module ${path.basename(modulePath)} must export an async init() function or be itself an async initializer.`
@@ -266,7 +268,13 @@ async function loadServerDescriptor(modulePath) {
   }
   if(candidate.meta && typeof candidate.meta==='object') {metaSources.push(candidate.meta);}
   const meta=metaSources.reduce((acc,fragment)=>Object.assign(acc,fragment),{});
-  return {app,domains,meta};
+  const initModule =
+    (meta && typeof meta.initModule === 'function' && meta.initModule) ||
+    (meta && typeof meta.initmodule === 'function' && meta.initmodule) ||
+    (rawExport && typeof rawExport.initModule === 'function' && rawExport.initModule) ||
+    (candidate && typeof candidate.initModule === 'function' && candidate.initModule) ||
+    undefined;
+  return {app,domains,meta,initModule};
 }
 
 async function parseExpressesDomains(filePath,filename,filetype){
@@ -376,7 +384,6 @@ function createStaticApp(rootDir) {
   app.use((req, res)=>{res.status(404).send('Not found');});
   return app;
 }
-
 function createAppDescriptors(descriptors,buildApp,kind) {
   const results=[];
   descriptors.forEach((descriptor)=>{
@@ -386,11 +393,11 @@ function createAppDescriptors(descriptors,buildApp,kind) {
   });
   return results;
 }
-function createStaticAppDescriptors(descriptors) {
-  return createAppDescriptors(descriptors,({absolutePath})=>createAppOfKind(path.dirname(absolutePath),'static'),'static');
-}
 function createProxyAppDescriptors(descriptors) {
   return createAppDescriptors(descriptors,({target})=>createAppOfKind(target,'proxy'),'proxy');
+}
+function createStaticAppDescriptors(descriptors) {
+  return createAppDescriptors(descriptors,({absolutePath})=>createAppOfKind(path.dirname(absolutePath),'static'),'static');
 }
 
 /* INTEGRATED APPS - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
@@ -470,9 +477,9 @@ function writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors,
     lines.push('');
   };
 
-  serverDescriptors.forEach((descriptor)=>pushEntry(descriptor, 'express'));
-  staticDescriptors.forEach((descriptor)=>pushEntry(descriptor, 'static'));
   proxyDescriptors.forEach((descriptor)=>pushEntry(descriptor, 'proxy'));
+  staticDescriptors.forEach((descriptor)=>pushEntry(descriptor, 'static'));
+  serverDescriptors.forEach((descriptor)=>pushEntry(descriptor, 'express'));
 
   fs.writeFileSync(CONFIG_PATH, lines.join('\n'));
   console.log(`Wrote config summary to ${CONFIG_PATH}`);
@@ -514,9 +521,9 @@ function parseConfigFile() {
           target:e.target
         };
       });
-  const servers=mapEntries('express');
-  const statics=mapEntries('static');
   const proxies=mapEntries('proxy');
+  const statics=mapEntries('static');
+  const servers=mapEntries('express');
   return {servers,statics,proxies };
 }
 
@@ -576,9 +583,9 @@ async function reconcileDescriptors({
 async function reconcileConfigInteractive() {
   const cfg = parseConfigFile();
   const kinds = [
-    { label: 'express', pattern: SERVERS_PATTERN, list: cfg.servers },
+    { label: 'proxy',   pattern: PROXY_PATTERN,   list: cfg.proxies },
     { label: 'static',  pattern: STATIC_PATTERN,  list: cfg.statics },
-    { label: 'proxy',   pattern: PROXY_PATTERN,   list: cfg.proxies }
+    { label: 'express', pattern: SERVERS_PATTERN, list: cfg.servers }
   ];
   const results={};
   for (const { label, pattern, list } of kinds) {
@@ -604,9 +611,9 @@ function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescri
           domainToApp.set(normalized, { app, source: filename });
         });
   });};
-  attachDescriptors(serverDescriptors);
-  attachDescriptors(staticAppDescriptors);
   attachDescriptors(proxyAppDescriptors);
+  attachDescriptors(staticAppDescriptors);
+  attachDescriptors(serverDescriptors);
   return domainToApp;
 }
 
@@ -651,8 +658,7 @@ async function main(options={}) {
   console.log(httpExpresses.HELP_TEXT);
   applyConfiguration(options);
   if(options.help||options.update){return;}
-  let serverDescriptors=[];let staticDescriptors=[];
-  let proxyDescriptors=[];
+  let proxyDescriptors=[]; let staticDescriptors=[];let serverDescriptors=[];
   const parsed=parseConfigFile();
   const {servers,statics,proxies}=parsed;
   proxyDescriptors=proxies.map((item)=>({
@@ -670,6 +676,21 @@ async function main(options={}) {
       const domains=spec.domains && spec.domains.length ? spec.domains : descriptor.domains;
       serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
     } catch (error) {console.warn(`Skipping ${spec.displayName}: ${error.message}`);}
+  }
+  for (const descriptor of serverDescriptors) {
+    if (descriptor && typeof descriptor.initModule === 'function') {
+      try {
+        await descriptor.initModule({
+          app: descriptor.app,
+          domains: descriptor.domains,
+          meta: descriptor.meta,
+          filename: descriptor.filename,
+          absolutePath: descriptor.absolutePath
+        });
+      } catch (error) {
+        console.error(`InitModule hook failed for ${descriptor.filename}:`, error);
+      }
+    }
   }
   let certificateEntries=loadCertificateEntries();
   const proxyApps=createProxyAppDescriptors(proxyDescriptors);
