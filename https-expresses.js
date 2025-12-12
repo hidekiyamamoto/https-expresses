@@ -695,7 +695,8 @@ function createRequestHandler(domainToApp, certDomainSet=new Set()) {
       }
     };
     runNextApp();
-} };}
+  };
+}
 async function main(options={}) {
   console.log(httpExpresses.HELP_TEXT);
   applyConfiguration(options);
