@@ -233,7 +233,11 @@ async function loadServerDescriptor(modulePath) {
   }
 
   let candidate;
-  try { candidate=await initializer.call(initializerContext);}
+  try {
+    const wantsContext=initializer.length>0;
+    const initArg=wantsContext ? {} : undefined;
+    candidate=await initializer.call(initializerContext, initArg);
+  }
   catch (error) {
     const enriched=new Error(`Module ${path.basename(modulePath)} failed during async init: ${error.message}`);
     enriched.cause=error;
