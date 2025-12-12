@@ -385,14 +385,19 @@ function createStaticApp(rootDir) {
     next();
   });
   app.use(serveStatic(rootDir, {fallthrough:true,extensions:['html', 'htm']}));
-  app.use((req, res)=>{res.status(404).send('Not found');});
+  // Do not send 404 here so multiple static roots can be chained.
+  // If this static root has no match, fall through to the next app.
+  app.use((req, res, next)=>{next();});
   return app;
 }
 function createAppDescriptors(descriptors,buildApp,kind) {
   const results=[];
   descriptors.forEach((descriptor)=>{
     const {filename,domains}=descriptor;
-    try {const app=buildApp(descriptor);results.push({filename,domains,app});}
+    try {
+      const app=buildApp(descriptor);
+      results.push({filename,domains,app,kind});
+    }
     catch(error){console.warn(`Skipping ${kind} ${filename}: ${error.message}`);}
   });
   return results;
@@ -607,18 +612,24 @@ async function reconcileConfigInteractive() {
 }
 
 function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescriptors=[]){
-  const domainToApp=new Map();
-  const attachDescriptors=(descriptors)=>{
-    descriptors.forEach(({domains,app,filename})=>{
-        domains.forEach((domain)=>{const normalized=String(domain).trim().toLowerCase();if(!normalized){return;}
-          if(domainToApp.has(normalized)){console.warn(`Domain ${normalized} already mapped; overriding with app from ${filename}.`);}
-          domainToApp.set(normalized, { app, source: filename });
-        });
-  });};
-  attachDescriptors(proxyAppDescriptors);
-  attachDescriptors(staticAppDescriptors);
-  attachDescriptors(serverDescriptors);
-  return domainToApp;
+  const domainToApps=new Map();
+  const attachDescriptors=(descriptors,kindOverride)=>{
+    descriptors.forEach(({domains,app,filename,kind})=>{
+      const effectiveKind=kindOverride || kind || 'express';
+      (domains || []).forEach((domain)=>{
+        const normalized=String(domain).trim().toLowerCase();
+        if(!normalized){return;}
+        const list=domainToApps.get(normalized) || [];
+        list.push({ app, source: filename, kind: effectiveKind });
+        domainToApps.set(normalized, list);
+      });
+    });
+  };
+  // Preserve existing priority: proxies, then statics, then express servers.
+  attachDescriptors(proxyAppDescriptors,'proxy');
+  attachDescriptors(staticAppDescriptors,'static');
+  attachDescriptors(serverDescriptors,'express');
+  return domainToApps;
 }
 
 function attachCertificateContexts(server, certEntries){
@@ -646,17 +657,44 @@ function createRequestHandler(domainToApp, certDomainSet=new Set()) {
   return function httpsRequestHandler(req, res) {
     const hostHeader=req.headers.host || '';
     const hostname=hostHeader.split(':')[0].toLowerCase();
-    const mapping=domainToApp.get(hostname);
+    const mappings=domainToApp.get(hostname);
     if(certDomainSet.has(hostname)) {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
       res.setHeader('Content-Security-Policy', 'upgrade-insecure-requests');}
-    if(!mapping) {res.statusCode=502;res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    if(!mappings || !mappings.length) {
+      res.statusCode=502;res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.end('No application configured for this domain.');return;}
-    try{mapping.app(req, res);}
-    catch(error){
-      console.error(`Error handling request for ${hostname} via ${mapping.source}:`, error);
-      if(!res.headersSent){res.statusCode=500;res.setHeader('Content-Type', 'text/plain; charset=utf-8');}
-      res.end('Internal server error.');
+    let index=0;
+    const runNextApp=()=>{
+      if(res.headersSent){return;}
+      if(index>=mappings.length){
+        // Nothing handled the request for this domain.
+        res.statusCode=404;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.end('Not found');
+        return;
+      }
+      const { app, source }=mappings[index++];
+      try{
+        // Always invoke apps with a next() handler so they can fall through.
+        app(req, res, (err)=>{
+          if(err){
+            console.error(`Error handling request for ${hostname} via ${source}:`, err);
+            if(!res.headersSent){
+              res.statusCode=500;
+              res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+              res.end('Internal server error.');
+            }
+            return;
+          }
+          if(!res.headersSent){runNextApp();}
+        });
+      } catch(error){
+        console.error(`Error handling request for ${hostname} via ${source}:`, error);
+        if(!res.headersSent){runNextApp();}
+      }
+    };
+    runNextApp();
 } };}
 async function main(options={}) {
   console.log(httpExpresses.HELP_TEXT);
