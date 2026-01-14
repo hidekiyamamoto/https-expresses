@@ -410,9 +410,71 @@ function createStaticAppDescriptors(descriptors) {
 }
 
 /* INTEGRATED APPS - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
-/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # CEERTIFICATES - START */
-function parseCertificateDomains(certBuffer,fallbackDomain) {
-  if (!certBuffer) {return fallbackDomain ? [fallbackDomain] : [];}
+/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # EXPRESS ROUTE MATCHING - START */
+function getRequestPath(req){
+  try {return new URL(req.url, 'http://localhost').pathname || '/';}
+  catch {return '/';}
+}
+
+function createSimplePathMatcher(routePath){
+  if(typeof routePath !== 'string'){return null;}
+  // Normalize repeated slashes and trim trailing slash (except root).
+  let normalized=routePath.replace(/\/+/g,'/');
+  if(normalized.length>1){normalized=normalized.replace(/\/+$/,'');}
+  if(normalized === '' || normalized === '*'){normalized='/';}
+
+  const patternSegments=normalized.split('/').filter(Boolean);
+  const isCatchAll=patternSegments.length===0;
+  const hasWildcard=patternSegments.includes('*');
+
+  return (requestPath)=>{
+    if(typeof requestPath!=='string'){return false;}
+    let p=requestPath.replace(/\/+/g,'/');
+    if(p.length>1){p=p.replace(/\/+$/,'');}
+    const pathSegments=p.split('/').filter(Boolean);
+    if(isCatchAll){return true;}
+    for(let i=0;i<patternSegments.length;i++){
+      const seg=patternSegments[i];
+      if(seg==='*'){return true;}
+      const v=pathSegments[i];
+      if(v===undefined){return false;}
+      if(seg.startsWith(':')){continue;}
+      if(seg!==v){return false;}
+    }
+    if(hasWildcard){return true;}
+    return pathSegments.length===patternSegments.length;
+  };
+}
+
+function extractExpressRouteMatchers(app){
+  const matchers=[];
+  const stack=
+    (app && app._router && Array.isArray(app._router.stack) && app._router.stack) ||
+    [];
+
+  for(const layer of stack){
+    const route=layer && layer.route;
+    if(!route){continue;}
+    const methodsObj=route.methods && typeof route.methods==='object' ? route.methods : {};
+    const methods=new Set(
+      Object.keys(methodsObj)
+        .filter((k)=>methodsObj[k])
+        .map((m)=>String(m).toUpperCase())
+    );
+    const paths=Array.isArray(route.path) ? route.path : [route.path];
+    for(const routePath of paths){
+      const matcher=createSimplePathMatcher(routePath);
+      if(!matcher){continue;}
+      matchers.push({ path: routePath, methods, matcher });
+    }
+  }
+  return matchers;
+}
+/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # EXPRESS ROUTE MATCHING - END */
+/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # CERTIFICATES - START */
+function parseCertificateInfo(certBuffer, fallbackDomain) {
+  const fallback=fallbackDomain ? [String(fallbackDomain).toLowerCase()] : [];
+  if (!certBuffer) {return { domains: fallback, notAfterMs: 0, fingerprint: null };}
   try {
     const certificate=new X509Certificate(certBuffer);
     const altNames=certificate.subjectAltName
@@ -423,18 +485,31 @@ function parseCertificateDomains(certBuffer,fallbackDomain) {
           .map((entry)=>entry.slice(4).toLowerCase())
       : [];
 
-    if (altNames.length) {return altNames;}
+    // CN is a last-resort fallback when SANs are missing.
+    let commonName=null;
+    if (!altNames.length && certificate.subject) {
+      const match=String(certificate.subject).match(/CN=([^,\/]+)/i);
+      if (match && match[1]) {commonName=String(match[1]).trim().toLowerCase();}
+    }
+
+    const domains=altNames.length ? altNames : commonName ? [commonName] : fallback;
+    const notAfterMs=Number.isFinite(Date.parse(certificate.validTo))
+      ? Date.parse(certificate.validTo)
+      : 0;
+    const fingerprint=certificate.fingerprint256 || certificate.fingerprint || null;
+    return { domains, notAfterMs, fingerprint };
   } catch (error) {
-    console.warn(`Could not parse certificate SANs for ${fallbackDomain}: ${error.message}`);
+    console.warn(`Could not parse certificate info for ${fallbackDomain}: ${error.message}`);
   }
-  return fallbackDomain ? [fallbackDomain.toLowerCase()] : [];
+  return { domains: fallback, notAfterMs: 0, fingerprint: null };
 }
 
 function loadCertificateEntries() {
   if(!fs.existsSync(CERT_ROOT)){throw new Error(`Certificate directory ${CERT_ROOT} does not exist.`);}
   const directories=fs.readdirSync(CERT_ROOT, { withFileTypes: true }).filter((entry)=>entry.isDirectory());
   if (!directories.length) {throw new Error(`No certificates found under ${CERT_ROOT}.`);}
-  const entries=directories.map((entry)=>{
+  const entries=[];
+  directories.forEach((entry)=>{
     const certDir=path.join(CERT_ROOT, entry.name);
     const keyPath=path.join(certDir,'privkey.pem');
     const certPath=path.join(certDir,'cert.pem');
@@ -442,10 +517,20 @@ function loadCertificateEntries() {
     const key=readFileIfExists(keyPath);
     const cert=readFileIfExists(certPath);
     const ca=readFileIfExists(chainPath);
-    if (!key || !cert) {throw new Error(`Missing key or certificate in ${certDir}.`);}
-    const domains=parseCertificateDomains(cert, entry.name);
-    return {key,cert,ca,domains,source:certDir};
+    if (!key || !cert) {
+      console.warn(`Skipping certificate directory (missing privkey.pem or cert.pem): ${certDir}`);
+      return;
+    }
+    const info=parseCertificateInfo(cert, entry.name);
+    entries.push({
+      key,cert,ca,
+      domains: info.domains,
+      notAfterMs: info.notAfterMs,
+      fingerprint: info.fingerprint,
+      source: certDir
+    });
   });
+  if (!entries.length) {throw new Error(`No usable certificates found under ${CERT_ROOT}.`);}
   return entries;
 }
 
@@ -464,7 +549,102 @@ function hasCertificateForDomain(domain,certEntries){
   return certEntries.some(({domains})=>domains.some((pattern)=>domainMatchesPattern(domain, pattern)));
 }
 
-/* CEERTIFICATES - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
+/* CERTIFICATES - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
+/* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # CERTIFICATE ASSOCIATION - START */
+function scorePatternSpecificity(pattern){
+  const p=String(pattern || '').toLowerCase();
+  if(!p){return 0;}
+  // Exact match always beats wildcard; longer names/suffixes beat shorter ones.
+  if(p.startsWith('*.')){return 1000 + (p.length - 2);}
+  return 2000 + p.length;
+}
+
+function selectBestCertificateForHostname(hostname, certEntries){
+  const normalized=String(hostname || '').trim().toLowerCase();
+  if(!normalized){return null;}
+
+  let bestEntry=null;
+  let bestPattern=null;
+  let bestNotAfter=-1;
+  let bestSpecificity=-1;
+
+  for(const entry of certEntries){
+    const entryNotAfter=Number(entry && entry.notAfterMs) || 0;
+    for(const pattern of (entry.domains || [])){
+      if(!domainMatchesPattern(normalized, pattern)){continue;}
+      const specificity=scorePatternSpecificity(pattern);
+      if(
+        entryNotAfter > bestNotAfter ||
+        (entryNotAfter === bestNotAfter && specificity > bestSpecificity)
+      ){
+        bestEntry=entry;
+        bestPattern=pattern;
+        bestNotAfter=entryNotAfter;
+        bestSpecificity=specificity;
+      }
+    }
+  }
+
+  if(!bestEntry){return null;}
+  return { entry: bestEntry, matchedPattern: bestPattern };
+}
+
+function createSniCertificateSelector(certEntries, options={}){
+  const debug=!!options.debug;
+  const contextCache=new Map(); // cacheKey -> SecureContext
+
+  const cacheKeyForEntry=(entry)=>{
+    const fp=entry && entry.fingerprint ? String(entry.fingerprint) : '';
+    return `${entry && entry.source ? entry.source : ''}::${fp}`;
+  };
+
+  const getContextForEntry=(entry)=>{
+    const key=cacheKeyForEntry(entry);
+    const cached=contextCache.get(key);
+    if(cached){return cached;}
+    const context=tls.createSecureContext({ key: entry.key, cert: entry.cert, ca: entry.ca });
+    contextCache.set(key, context);
+    return context;
+  };
+
+  const primary=certEntries[0];
+  const primaryContext=getContextForEntry(primary);
+
+  const select=(servername)=>{
+    const selection=selectBestCertificateForHostname(servername, certEntries);
+    if(!selection){
+      if(debug){console.log(`[SNI] ${servername} -> default (${primary.source})`);}
+      return { entry: primary, matchedPattern: null, matched: false, context: primaryContext };
+    }
+    if(debug){
+      console.log(`[SNI] ${servername} -> ${selection.matchedPattern} (${selection.entry.source})`);
+    }
+    return {
+      entry: selection.entry,
+      matchedPattern: selection.matchedPattern,
+      matched: true,
+      context: getContextForEntry(selection.entry)
+    };
+  };
+
+  return {
+    primary,
+    select,
+    hasMatch: (hostname)=>!!selectBestCertificateForHostname(hostname, certEntries)
+  };
+}
+
+function describeBestCertificateForHostname(hostname, certEntries){
+  const selection=selectBestCertificateForHostname(hostname, certEntries);
+  if(!selection){return null;}
+  const entry=selection.entry;
+  const source=entry && entry.source ? path.basename(entry.source) : null;
+  const expires=entry && entry.notAfterMs
+    ? new Date(entry.notAfterMs).toISOString().slice(0, 10)
+    : null;
+  return { source, expires, matchedPattern: selection.matchedPattern };
+}
+/* CERTIFICATE ASSOCIATION - END # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # */
 /* # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # CONFIG FILE - START */
 function writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors, certEntries){
   const lines=[];
@@ -479,7 +659,10 @@ function writeConfigFile(serverDescriptors, staticDescriptors, proxyDescriptors,
     if(!domains.length) {lines.push('    - (none) (cert: n/a)');} 
     else{
       domains.forEach((domain)=>{
-        const certStatus=hasCertificateForDomain(domain, certEntries) ? 'present' : 'missing';
+        const certInfo=describeBestCertificateForHostname(domain, certEntries);
+        const certStatus=certInfo
+          ? `present; source=${certInfo.source || 'unknown'}; expires=${certInfo.expires || 'unknown'}; match=${certInfo.matchedPattern || 'unknown'}`
+          : 'missing';
         lines.push(`    - ${domain} (cert: ${certStatus})`);
       });
     }
@@ -614,13 +797,13 @@ async function reconcileConfigInteractive() {
 function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescriptors=[]){
   const domainToApps=new Map();
   const attachDescriptors=(descriptors,kindOverride)=>{
-    descriptors.forEach(({domains,app,filename,kind})=>{
+    descriptors.forEach(({domains,app,filename,kind,matchers})=>{
       const effectiveKind=kindOverride || kind || 'express';
       (domains || []).forEach((domain)=>{
         const normalized=String(domain).trim().toLowerCase();
         if(!normalized){return;}
         const list=domainToApps.get(normalized) || [];
-        list.push({ app, source: filename, kind: effectiveKind });
+        list.push({ app, source: filename, kind: effectiveKind, matchers });
         domainToApps.set(normalized, list);
       });
     });
@@ -632,33 +815,14 @@ function buildDomainAppMap(serverDescriptors,staticAppDescriptors,proxyAppDescri
   return domainToApps;
 }
 
-function attachCertificateContexts(server, certEntries){
-  const assigned=new Set();
-  certEntries.forEach(({ key, cert, ca, domains, source })=>{
-    domains.forEach((domain)=>{
-      const normalized=domain.trim().toLowerCase();
-      if(!normalized || assigned.has(normalized)){return;}
-      const context=tls.createSecureContext({ key, cert, ca });
-      server.addContext(normalized, context);
-      assigned.add(normalized);
-    });
-    if(!domains.length){console.warn(`No domains determined for certificate in ${source}; skipping addContext.`);}
-  });
-}
-
-function buildCertDomainSet(ee){
-  const set=new Set();
-  ee.forEach(({domains})=>{(domains||[]).forEach((d)=>{const n=String(d || '').trim().toLowerCase();
-    if(n){set.add(n);}});
-  });return set;
-}
-
-function createRequestHandler(domainToApp, certDomainSet=new Set()) {
+function createRequestHandler(domainToApp, hasMatchingCertificate=()=>false) {
   return function httpsRequestHandler(req, res) {
     const hostHeader=req.headers.host || '';
     const hostname=hostHeader.split(':')[0].toLowerCase();
     const mappings=domainToApp.get(hostname);
-    if(certDomainSet.has(hostname)) {
+    const requestPath=getRequestPath(req);
+    const requestMethod=String(req.method || 'GET').toUpperCase();
+    if(hasMatchingCertificate(hostname)) {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
       res.setHeader('Content-Security-Policy', 'upgrade-insecure-requests');}
     if(!mappings || !mappings.length) {
@@ -674,7 +838,15 @@ function createRequestHandler(domainToApp, certDomainSet=new Set()) {
         res.end('Not found');
         return;
       }
-      const { app, source }=mappings[index++];
+      const mapping=mappings[index++];
+      const { app, source }=mapping;
+      if(mapping && mapping.kind==='express' && Array.isArray(mapping.matchers) && mapping.matchers.length){
+        const matched=mapping.matchers.some((m)=>{
+          if(m.methods && m.methods.size && !m.methods.has(requestMethod)){return false;}
+          return m.matcher(requestPath);
+        });
+        if(!matched){runNextApp();return;}
+      }
       try{
         // Always invoke apps with a next() handler so they can fall through.
         app(req, res, (err)=>{
@@ -696,6 +868,18 @@ function createRequestHandler(domainToApp, certDomainSet=new Set()) {
     };
     runNextApp();
   };
+}
+
+function reportCertificateCoverage(domainToApp, hasMatchingCertificate, primarySource){
+  const uncovered=[];
+  for(const domain of domainToApp.keys()){
+    if(!hasMatchingCertificate(domain)){uncovered.push(domain);}
+  }
+  if(uncovered.length){
+    console.warn(
+      `No certificate matches these configured domains (default cert will be served: ${primarySource}): ${uncovered.join(', ')}`
+    );
+  }
 }
 async function main(options={}) {
   console.log(httpExpresses.HELP_TEXT);
@@ -720,6 +904,10 @@ async function main(options={}) {
       serverDescriptors.push({ ...descriptor, filename: spec.displayName, absolutePath: spec.absolutePath, domains });
     } catch (error) {console.warn(`Skipping ${spec.displayName}: ${error.message}`);}
   }
+  serverDescriptors=serverDescriptors.map((d)=>({
+    ...d,
+    matchers: extractExpressRouteMatchers(d.app)
+  }));
   for (const descriptor of serverDescriptors) {
     if (descriptor && typeof descriptor.initModule === 'function') {
       try {
@@ -739,11 +927,19 @@ async function main(options={}) {
   const proxyApps=createProxyAppDescriptors(proxyDescriptors);
   const staticApps=createStaticAppDescriptors(staticDescriptors);
   const domainToApp=buildDomainAppMap(serverDescriptors, staticApps, proxyApps);
-  const certDomainSet=buildCertDomainSet(certificateEntries);
-  const primaryCert=certificateEntries[0];
-  const httpsServer=https.createServer({key:primaryCert.key,cert:primaryCert.cert,ca:primaryCert.ca},
-    createRequestHandler(domainToApp,certDomainSet));
-  attachCertificateContexts(httpsServer, certificateEntries);
+  const certificateSelector=createSniCertificateSelector(certificateEntries, {
+    debug: !!process.env.HTS_DEBUG_CERTS
+  });
+  reportCertificateCoverage(domainToApp, certificateSelector.hasMatch, certificateSelector.primary.source);
+  const httpsServer=https.createServer({
+    key: certificateSelector.primary.key,
+    cert: certificateSelector.primary.cert,
+    ca: certificateSelector.primary.ca,
+    SNICallback: (servername, cb) => {
+      try {cb(null, certificateSelector.select(servername).context);}
+      catch (error) {cb(error);}
+    }
+  }, createRequestHandler(domainToApp, certificateSelector.hasMatch));
   httpsServer.on('listening',()=>{console.log(`HTTPS server listening on port ${HTTPS_PORT}.`);});
   httpsServer.on('error',(error)=>{console.error('HTTPS server encountered an error:',error);});
   httpsServer.listen(HTTPS_PORT);

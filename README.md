@@ -27,6 +27,7 @@ node https-expresses.js
 On start it will:
 - Print help
 - Load certificates from `/etc/letsencrypt/live` (or `--cert-root`).
+- Config `cert:` status is computed from the certificate files themselves (SAN/CN + expiry), and includes the chosen certificate folder + expiration date.
 - Load app modules and statics from the existing `https-expresses.cfg` (see below).
 - For any domain with a valid cert, add:
   - `Strict-Transport-Security`
@@ -148,6 +149,7 @@ Help is printed automatically at startup so you don’t forget what’s availabl
 
 - No reverse proxy required if you’re happy with Node terminating TLS.
 - Config is meant to be **checked into git** (minus certs), so the routing topology is reviewable.
+- Set `HTS_DEBUG_CERTS=1` to log which certificate is selected for each SNI hostname.
 - The design assumes you’re comfortable editing text files and saying “y/n” in a terminal. If you prefer GUIs, this probably isn’t your router.
 
 That’s it: one process, many domains, and a simple contract for your apps and static sites.
